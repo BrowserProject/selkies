@@ -1145,6 +1145,9 @@ class CentralizedStreamServer:
         ).resolve()
         self._chunked_uploads: Dict[str, Dict[str, Any]] = {}
         self.web_files_ctx: Optional[tempfile.TemporaryDirectory] = None
+        # Set when this build simply ships no packaged viewer, which is a
+        # deployment choice and not an error (see _get_static_content_path).
+        self.packaged_web_absent: bool = False
 
         self._clients_present: bool = False
         self._client_hook_tasks: Set[asyncio.Task] = set()
@@ -2361,6 +2364,19 @@ class CentralizedStreamServer:
         logger.info("Defaulting to packaged web files.")
         try:
             package_path = importlib_resources.files(self.STATIC_CONTENT_PATH)
+        except (ModuleNotFoundError, ImportError):
+            # A build that ships no packaged viewer is a deployment choice, not
+            # a failure: the frontend serves the viewer and this process serves
+            # the API alone. Recorded at INFO so a real extraction failure
+            # (permissions, disk, a corrupt wheel) keeps the ERROR below to
+            # itself.
+            self.packaged_web_absent = True
+            logger.info(
+                f"No packaged web files in this build ({self.STATIC_CONTENT_PATH} "
+                "is not installed); serving the API without a bundled frontend."
+            )
+            return ""
+        try:
             self.web_files_ctx = tempfile.TemporaryDirectory(prefix="selkies_web")
             temp_path = pathlib.Path(self.web_files_ctx.name)
             await asyncio.to_thread(self._copy_traversable, package_path, temp_path)
@@ -2630,6 +2646,8 @@ class CentralizedStreamServer:
             self.app.router.add_static(
                 f"{api_prefix}/", self.static_fs_path, name="static"
             )
+        elif getattr(self, "packaged_web_absent", False):
+            logger.info("No packaged web content; serving the API without web routes.")
         else:
             logger.warning("Unable to find web content, skipping web routers handlers")
         return self.app
