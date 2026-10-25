@@ -38,6 +38,7 @@ import errno
 import ipaddress
 import itertools
 import logging
+import os
 import random
 import re
 import secrets
@@ -115,12 +116,34 @@ def candidate_pair_priority(
     return (1 << 32) * min(G, D) + 2 * max(G, D) + (G > D and 1 or 0)
 
 
+def ice_interface_allowlist() -> Optional[set[str]]:
+    """Interface names `SELKIES_ICE_INTERFACES` limits host candidates to.
+
+    Returns None when the variable is unset or empty, which keeps the
+    unfiltered upstream behaviour.
+    """
+    names = {
+        name.strip()
+        for name in os.environ.get("SELKIES_ICE_INTERFACES", "").split(",")
+        if name.strip()
+    }
+    return names or None
+
+
+def _adapter_name(adapter: "ifaddr.Adapter") -> str:
+    name = adapter.name
+    return name.decode("utf-8", "replace") if isinstance(name, bytes) else name
+
+
 def get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> list[str]:
     """
     Get local IP addresses.
     """
+    allowlist = ice_interface_allowlist()
     addresses = []
     for adapter in ifaddr.get_adapters():
+        if allowlist is not None and _adapter_name(adapter) not in allowlist:
+            continue
         for ip in adapter.ips:
             if isinstance(ip.ip, str) and use_ipv4 and ip.ip != "127.0.0.1":
                 addresses.append(ip.ip)
