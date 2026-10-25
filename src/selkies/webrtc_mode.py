@@ -244,6 +244,7 @@ class WebRTCService(BaseStreamingService):
         self.display_pipelines: Dict[str, MediaPipelinePixel] = {}
         self._last_idr_request_times: Dict[str, float] = {}
         self._display_lock = asyncio.Lock()
+        self._stream_resize_lock = asyncio.Lock()
         self._primary_dims: Optional[Tuple[int, int]] = None
         self._wayland_ctl_module: Optional[Any] = None
         self._host_output_capacity: Optional[int] = None
@@ -853,7 +854,11 @@ class WebRTCService(BaseStreamingService):
         if self.metrics:
             await self.metrics.set_webrtc_stats(webrtc_stat_type, webrtc_stats)
 
-    async def on_resize_handler(self, res: str, display_id: str = "primary") -> None:
+    async def on_resize_handler(self, res: str, display_id: str = "primary", adaptive: bool = False) -> None:
+        async with self._stream_resize_lock:
+            await self._on_resize_handler(res, display_id, adaptive)
+
+    async def _on_resize_handler(self, res: str, display_id: str = "primary", adaptive: bool = False) -> None:
         """Route a client resolution to its display: the primary resizes the real
         display directly while it is alone; once a secondary display is connected
         (or for any secondary), the resolution feeds the extended-desktop layout
@@ -868,6 +873,20 @@ class WebRTCService(BaseStreamingService):
         if display_id == "primary" and not self.args.enable_resize:
             logger.warning(f"remote resizing disabled, skipping resize to {res}")
             return
+        if self.args.congestion_control and self._server_locked_dims() is None:
+            from .stream_control import fit_dimensions
+            dims = parse_resize_dims(res)
+            if dims is None:
+                return
+            if not hasattr(self, "_stream_requested_dims"):
+                self._stream_requested_dims = {}
+                self._stream_pixel_caps = {}
+            if not adaptive:
+                self._stream_requested_dims[display_id] = dims
+            cap = self._stream_pixel_caps.get(display_id)
+            if cap and not self._display_setting(display_id, "manual_resolution"):
+                w, h = fit_dimensions(*dims, cap)
+                res = f"{w}x{h}"
         if display_id != "primary" or self.display_clients:
             locked_dims = self._server_locked_dims()
             if locked_dims is not None:
@@ -2279,6 +2298,12 @@ class WebRTCService(BaseStreamingService):
         self._store_display_setting(display_id, key, value)
         pipeline = self.display_pipelines.get(display_id)
         if pipeline is not None:
+            if self.args.congestion_control and pipeline.rc_mode == RateControlMode.CBR:
+                if key == "video_bitrate":
+                    value = min(value, pipeline.video_bitrate)
+                elif key == "framerate":
+                    from .stream_control import frame_rate
+                    value = frame_rate(pipeline.video_bitrate, pipeline.width * pipeline.height, value)
             await applier(pipeline, value)
         if key == "encoder" and display_id == "primary":
             self.settings.encoder = str(value)
@@ -2336,7 +2361,7 @@ class WebRTCService(BaseStreamingService):
             "video_paintover_burst_frames",
         ]
         # Startup resolution policy, not a per-stream tunable.
-        primary_only_keys = ("manual_resolution", "manual_width", "manual_height")
+        primary_only_keys = ("manual_width", "manual_height")
 
         display_id = display_id or "primary"
         if display_id != "primary" and display_id not in self.display_clients:
@@ -2463,7 +2488,8 @@ class WebRTCService(BaseStreamingService):
         if transport is None:
             return None
         lo_kbps, hi_kbps = settings.video_bitrate
-        enc_kbps = float(self._display_setting(display_id, "video_bitrate") or hi_kbps)
+        pipeline = self.display_pipelines.get(display_id)
+        enc_kbps = float(pipeline.video_bitrate if pipeline else lo_kbps)
         enc_bps = int(max(lo_kbps, min(hi_kbps, enc_kbps)) * 1000)
         if not transport.pacer_enabled():
             vsender = None
@@ -2523,8 +2549,11 @@ class WebRTCService(BaseStreamingService):
         # No getattr default: a misnamed setting must raise, not disable the pacer.
         pacer_on = bool(settings.webrtc_pacer[0])
         logger.info(f"WebRTC pacer setting: {'ON' if pacer_on else 'OFF'}.")
+        from .stream_control import CONFIG, StreamController, frame_rate
+        controllers = {}
         while True:
             await asyncio.sleep(1.0)
+            lo_kbps, hi_kbps = settings.video_bitrate
             rtc_app = self.rtc_app
             if not rtc_app:
                 continue
@@ -2544,10 +2573,11 @@ class WebRTCService(BaseStreamingService):
                 if window is None:
                     continue
                 bucket = per_display.setdefault(
-                    did, {"goodputs": [], "worst_loss": 0.0})
+                    did, {"goodputs": [], "worst_loss": 0.0, "worst_delay": 0.0})
                 if window["goodput_bps"]:
                     bucket["goodputs"].append(window["goodput_bps"])
                 bucket["worst_loss"] = max(bucket["worst_loss"], window["loss_fraction"])
+                bucket["worst_delay"] = max(bucket["worst_delay"], window["queue_delay_s"])
             if self.ws_sink is not None:
                 # Each sink client's smoothed goodput and its relay's loss
                 # signal, in the shape a peer's TWCC window has: the rule below
@@ -2556,6 +2586,14 @@ class WebRTCService(BaseStreamingService):
                 self.ws_sink.merge_congestion(per_display)
             if self.metrics is not None:
                 self.metrics.set_bridge_drops(rtc_app.bridge_drops())
+            controllers = {p: c for p, c in controllers.items() if p in self.display_pipelines.values()}
+            active_displays = {"primary", *self.display_clients, *self.display_pipelines}
+            for name in ("_stream_requested_dims", "_stream_pixel_caps"):
+                values = getattr(self, name, None)
+                if values is not None:
+                    for did in list(values):
+                        if did not in active_displays:
+                            values.pop(did, None)
             for did, bucket in per_display.items():
                 if not self.args.congestion_control:
                     continue
@@ -2566,23 +2604,41 @@ class WebRTCService(BaseStreamingService):
                 ):
                     continue
                 goodputs, worst_loss = bucket["goodputs"], bucket["worst_loss"]
-                if not goodputs:
+                if not goodputs and not worst_loss:
                     continue
-                current = float(pipeline.video_bitrate)
-                ceiling = float(self._display_setting(did, "video_bitrate") or hi_kbps)
-                ceiling = max(lo_kbps, min(hi_kbps, ceiling))
-                if worst_loss > 0.10:
-                    target = current * 0.7
-                else:
-                    # Goodput may lift the target, never drag it down (see docstring).
-                    target = min(ceiling, max(current * 1.15, min(goodputs) * 0.85 / 1_000))
-                target = round(max(lo_kbps, min(ceiling, target)))
-                if target != round(current):
-                    logger.info(
-                        f"Congestion control[{did}]: video bitrate {current:.0f} -> {target:.0f} kbps "
-                        f"(goodput {min(goodputs) / 1e3:.1f} kbps, loss {worst_loss:.1%})"
-                    )
-                    await pipeline.set_video_bitrate(target)
+                try:
+                    current = float(pipeline.video_bitrate)
+                    ceiling = float(self._display_setting(did, "video_bitrate") or hi_kbps)
+                    ceiling = max(lo_kbps, min(hi_kbps, ceiling))
+                    controller = controllers.setdefault(pipeline, StreamController())
+                    target = controller.target(current, ceiling, lo_kbps, goodputs, worst_loss, bucket.get("worst_delay", 0))
+                    requested = getattr(self, "_stream_requested_dims", {}).get(did, (pipeline.width, pipeline.height))
+                    fps_ceiling = int(self._display_setting(did, "framerate"))
+                    if controller.pixel_cap < requested[0] * requested[1]:
+                        fps_ceiling = min(fps_ceiling, int(CONFIG["reduced_fps"]))
+                    fps = frame_rate(target, pipeline.width * pipeline.height, fps_ceiling, pipeline.framerate)
+                    if target != round(current):
+                        logger.info(
+                            f"Congestion control[{did}]: video bitrate {current:.0f} -> {target:.0f} kbps "
+                            f"(goodput {min(goodputs, default=0) / 1e3:.1f} kbps, loss {worst_loss:.1%})"
+                        )
+                        await pipeline.set_video_bitrate(target)
+                    if controller.congested and fps != pipeline.framerate:
+                        await pipeline.set_framerate(fps)
+                    if controller.congested and self.args.enable_resize and not self._display_setting(did, "manual_resolution") and self._server_locked_dims() is None:
+                        from .stream_control import fit_dimensions
+                        requested = getattr(self, "_stream_requested_dims", {}).get(did, (pipeline.width, pipeline.height))
+                        cap = controller.resolution_cap(target)
+                        fitted = fit_dimensions(*requested, cap)
+                        if fitted != (pipeline.width, pipeline.height):
+                            if not hasattr(self, "_stream_pixel_caps"):
+                                self._stream_pixel_caps = {}
+                                self._stream_requested_dims = {}
+                            self._stream_requested_dims[did] = requested
+                            self._stream_pixel_caps[did] = cap
+                            await self.on_resize_handler(f"{requested[0]}x{requested[1]}", did, adaptive=True)
+                except Exception:
+                    logger.exception("Stream adaptation failed (display %s)", did)
 
     async def start_components(self) -> None:
         """Start the background tasks: input/clipboard/cursor workers, startup

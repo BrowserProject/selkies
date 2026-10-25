@@ -2597,6 +2597,8 @@ def apply_common_capture_settings(
     # CBR QP clamp (0 = encoder default).
     cs.video_min_qp = int(getattr(server, "video_min_qp", 0) or 0)
     cs.video_max_qp = int(getattr(server, "video_max_qp", 0) or 0)
+    from .stream_control import vbv_frames
+    cs.video_vbv_multiplier = vbv_frames(framerate)
     cs.use_cpu = bool(use_cpu)
     if cs.use_cpu and encoder != "jpeg":
         from .settings import software_h264_encoder

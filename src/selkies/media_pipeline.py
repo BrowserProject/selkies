@@ -214,6 +214,9 @@ class MediaPipelinePixel(MediaPipeline):
         self.framerate = framerate
         self.video_bitrate = video_bitrate
         self.rc_mode = rc_mode
+        if rc_mode == RateControlMode.CBR and app_settings.congestion_control[0]:
+            from .stream_control import CONFIG
+            self.video_bitrate = min(video_bitrate, int(CONFIG["startup_kbps"]))
         self.video_crf = crf
         self.video_fullcolor = video_fullcolor
         self.use_cpu = use_cpu
@@ -468,6 +471,8 @@ class MediaPipelinePixel(MediaPipeline):
             self.framerate = framerate
             if not self._is_screen_capturing or self.capture_module is None:
                 return
+            from .stream_control import vbv_frames
+            self.capture_module.update_vbv_multiplier(vbv_frames(self.framerate))
             self.capture_module.update_framerate(float(self.framerate))
             logger.info(f"Updated framerate to: {self.framerate}")
 
