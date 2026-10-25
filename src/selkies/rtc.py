@@ -100,6 +100,7 @@ from .input_handler import (
 from .selkies import current_session_tokens
 from .ws_sink import (dispatch_client_message, gamepad_denied,
                       secure_input_denied, viewer_is_collaborator)
+from .stream_hold import PATH_PROTOCOLS, RTX_TIME_MS
 
 
 def parse_webrtc_port_range(raw: str) -> Optional[Tuple[int, int]]:
@@ -185,6 +186,10 @@ IDR_REQUEST_FLOOR_S = 0.25
 # own, so an encoder that ignores requests degrades to a smear rather than
 # a dead stream.
 GATE_TIMEOUT_S = 1.0
+# A viewer's report of the protocol its selected candidate pair runs on
+# (`_path,udp|tcp|tls`, anything else is unknown), which the static hold's
+# link verdict reads.
+PATH_REPORT_PREFIX = "_path,"
 
 
 async def drain_data_channel(channel: RTCDataChannel,
@@ -450,6 +455,8 @@ class RTCApp:
         on_audio_consumer_active: Per-peer audio pause (the side menu's
             STOP_AUDIO / START_AUDIO); left None the verbs are dropped.
         on_consumers_changed: A display's consumer set changed (join, close).
+        on_path_protocol: Called as `(peer_id, display_id)` when a viewer's
+            `_path` report changes the protocol recorded for its peer.
         provision_virtual_mic: Brings up the shared SelkiesVirtualMic (null
             sinks, module-virtual-source, default source) before a mic
             playback opens its `input` stream, so an app recording the default
@@ -499,11 +506,12 @@ class RTCApp:
         self.on_ice = lambda ice, client_peer_id: logger.warning('unhandled ice event')
         self.on_sdp = lambda sdp_type, sdp, client_peer_id: logger.warning('unhandled sdp event')
 
-        self.request_idr_frame = lambda display_id='primary': logger.warning('unhandled request_idr_frame')
+        self.request_idr_frame = lambda display_id='primary', **_: logger.warning('unhandled request_idr_frame')
 
         self.on_video_consumer_active = None
         self.on_audio_consumer_active = None
         self.on_consumers_changed = None
+        self.on_path_protocol = None
 
         self.provision_virtual_mic = None
 
@@ -988,7 +996,8 @@ class RTCApp:
                   use_cpu: Optional[bool] = None) -> str:
         """Rewrite the local offer SDP for optimal streaming behavior.
 
-        Injects a 125 ms rtx-time, `sps-pps-idr-in-keyframe=1` for H.264/H.265,
+        Injects the rtx-time the static hold's decoder deadline is derived
+        from (`stream_hold.RTX_TIME_MS`), `sps-pps-idr-in-keyframe=1` for H.264/H.265,
         the Opus ptime, and generous video bandwidth ceilings
         (`_munge_video_bandwidth`). Displays can run different encoders,
         chroma formats and software-encoding flags; the caller passes the ones
@@ -1027,12 +1036,13 @@ class RTCApp:
         software_path = software_h264_path(
             encoder, use_cpu or str(getattr(app_settings, "gpu_id", "")).strip() == "-1")
         sdp_text = sdp
+        rtx_time = f"rtx-time={RTX_TIME_MS}"
         if 'rtx-time' not in sdp_text:
             logger.warning("injecting rtx-time to SDP")
-            sdp_text = re.sub(r'(apt=\d+)', r'\1;rtx-time=125', sdp_text)
-        elif 'rtx-time=125' not in sdp_text:
+            sdp_text = re.sub(r'(apt=\d+)', rf'\1;{rtx_time}', sdp_text)
+        elif rtx_time not in sdp_text:
             logger.warning("injecting modified rtx-time to SDP")
-            sdp_text = re.sub(r'rtx-time=\d+', r'rtx-time=125', sdp_text)
+            sdp_text = re.sub(r'rtx-time=\d+', rtx_time, sdp_text)
         if "h264" in encoder or "x264" in encoder or "h265" in encoder or "x265" in encoder:
             if 'sps-pps-idr-in-keyframe' not in sdp_text:
                 logger.warning("injecting sps-pps-idr-in-keyframe to SDP")
@@ -1598,6 +1608,10 @@ class RTCApp:
         once no peer receives it. Everything else reaches the late-bound
         `on_data_message` with the peer id as the connection id, so
         per-connection input state (gamepad associations) traces to the peer.
+        Ahead of all of them, and so for viewers too, a `_path,<protocol>`
+        report is recorded on the peer entry, a protocol other than udp, tcp
+        or tls as unknown (a changed one reaches `on_path_protocol`), and
+        consumed either way.
 
         Returns:
             Whatever the dispatched handler returns (possibly an awaitable,
@@ -1612,6 +1626,16 @@ class RTCApp:
                 channel.send("_gz,1")
             except Exception as e:
                 logger.warning("Failed to ack compression handshake: %s", e)
+
+        if isinstance(msg, str) and msg.startswith(PATH_REPORT_PREFIX):
+            peer = self.peer_connections.get(peer_id)
+            protocol = msg[len(PATH_REPORT_PREFIX):]
+            protocol = protocol if protocol in PATH_PROTOCOLS else None
+            if peer is not None and peer.get("path_protocol") != protocol:
+                peer["path_protocol"] = protocol
+                if self.on_path_protocol is not None:
+                    self.on_path_protocol(peer_id, peer.get("display_id") or "primary")
+            return None
 
         return dispatch_client_message(
             msg,
@@ -1697,7 +1721,9 @@ class RTCApp:
         if not peer_obj or peer_obj.get("video_paused"):
             return
         display_id = peer_obj.get("display_id") or "primary"
-        asyncio.run_coroutine_threadsafe(self.request_idr_frame(display_id), self.async_event_loop)
+        asyncio.run_coroutine_threadsafe(
+            self.request_idr_frame(display_id, reason="pli", peer_id=client_peer_id),
+            self.async_event_loop)
 
     def _keyframe_request(self, display_id: str) -> Callable[[], None]:
         """Build the keyframe request of a display's video bridge.

@@ -53,15 +53,17 @@ import logging
 import time
 from enum import Enum
 from abc import ABCMeta, abstractmethod
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Awaitable, Callable, Optional, Tuple
 
-from .settings import settings as app_settings
+from .settings import settings as app_settings, software_h264_encoder
 from .audio_control import AudioControl
 from .display_utils import (
     apply_common_capture_settings,
     format_pixelflux_cursor,
     release_pixelflux_cursor_callback,
 )
+from .stream_hold import (CONFIG as HOLD_CONFIG, HOUSEKEEPING_S as HOLD_HOUSEKEEPING_S,
+                          MODE as HOLD_MODE, StaticHold, read_nr_throttled)
 
 # An ABI-skewed non-abi3 wheel raises RuntimeError rather than ImportError.
 try:
@@ -126,7 +128,7 @@ class MediaPipeline(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    async def dynamic_idr_frame(self) -> None:
+    async def dynamic_idr_frame(self, reason: str = "request", peer_id: Optional[str] = None) -> None:
         pass
 
     @abstractmethod
@@ -167,6 +169,14 @@ class MediaPipelinePixel(MediaPipeline):
             X11 XFixes monitor), already in the client cursor-message shape.
         get_cursor_size_cap: Longest cursor edge the X11 monitor delivers
             (DPI-scaled upstream); `<= 0` falls back to the settings default.
+        static_hold: The display's `stream_hold.StaticHold`. Its `gated` flag
+            is folded into every settings snapshot, so each `update_tunables`
+            carries the effective streaming flag.
+        get_hold_link: `(samples, sinks)` of the display's unpaused video
+            consumers for the hold's link verdict; None means ineligible.
+        on_hold_padding: Awaitable that takes a padding tick's boundary and
+            pads every video sender of the held display that sent nothing
+            since it.
         capture_module: pixelflux `ScreenCapture`; Any, the import is optional.
         pcmflux_module: pcmflux `AudioCapture`; likewise.
         _video_pts_anchor: Video pts clock origin; pipeline-scoped rather than
@@ -244,6 +254,15 @@ class MediaPipelinePixel(MediaPipeline):
         self.on_ws_frame: Optional[Callable[[Any], None]] = None
         self.on_ws_audio: Optional[Callable[[Any], None]] = None
         self.get_cursor_size_cap: Callable[[], int] = lambda: 0
+        self.get_hold_link: Callable[[], Any] = lambda: None
+        self.on_hold_padding: Optional[Callable[[float], Awaitable[None]]] = None
+        self.static_hold = StaticHold(HOLD_CONFIG, HOLD_MODE, push=self._hold_push,
+                                      link=lambda: self.get_hold_link(), scope=self._hold_scope,
+                                      display=self.display_id)
+        self._hold_task: Optional[asyncio.Task] = None
+        self._hold_wakeup = asyncio.Event()
+        self._hold_timer: Optional[asyncio.TimerHandle] = None
+        self._hold_restart: Optional[asyncio.Task] = None
 
         self.capture_module: Any = None
         self.pcmflux_module: Any = None
@@ -346,9 +365,12 @@ class MediaPipelinePixel(MediaPipeline):
         await self.restart_screen_capture()
 
     async def _apply_tunables_live(self, what: str) -> None:
-        """Push current capture settings to the running module with no restart."""
+        """Push current capture settings to the running module with no restart.
+        The change may take the display out of the hold's scope, so the hold is
+        re-evaluated first."""
         if not self._is_screen_capturing or self.capture_module is None:
             return
+        self.static_hold.reevaluate("settings")
         try:
             self.capture_module.update_tunables(self.generate_capture_settings())
             logger.info(f"Updated {what} live")
@@ -471,15 +493,24 @@ class MediaPipelinePixel(MediaPipeline):
             self.framerate = framerate
             if not self._is_screen_capturing or self.capture_module is None:
                 return
+            # The frame-rate change reopens x264, whose keyframe must stream.
+            self.static_hold.wake("fps")
             from .stream_control import vbv_frames
             self.capture_module.update_vbv_multiplier(vbv_frames(self.framerate))
             self.capture_module.update_framerate(float(self.framerate))
             logger.info(f"Updated framerate to: {self.framerate}")
 
-    async def dynamic_idr_frame(self) -> None:
-        """Request an IDR frame from pixelflux."""
+    async def dynamic_idr_frame(self, reason: str = "request", peer_id: Optional[str] = None) -> None:
+        """Request an IDR frame from pixelflux.
+
+        The hold streams again first: pixelflux applies the tunables and the
+        IDR request on the same tick, so the keyframe's refinement frames
+        follow it as without the hold. `reason` and `peer_id` let the hold
+        count a PLI from an established peer as a fault.
+        """
         if not self._is_screen_capturing or self.capture_module is None:
             return
+        self.static_hold.idr(reason, peer_id)
         try:
             self.capture_module.request_idr_frame()
             logger.debug("IDR frame requested successfully")
@@ -495,7 +526,9 @@ class MediaPipelinePixel(MediaPipeline):
         header: its picture-type byte says whether the encoder produced a
         keyframe, which the video bridge needs to keep the wire decodable
         across a drop. The header is sliced off the zero-copy view before RTP
-        framing.
+        framing. The streaming flag is the effective one (configured and not
+        gated by the static hold), and every live push builds a fresh snapshot
+        here, so none can carry a stale flag.
 
         Returns:
             A populated `pixelflux.CaptureSettings` (annotated as Any because
@@ -528,7 +561,7 @@ class MediaPipelinePixel(MediaPipeline):
             paintover_crf=self.video_paintover_crf,
             paintover_burst=self.video_paintover_burst_frames,
             fullcolor=self.video_fullcolor,
-            streaming=self.video_streaming_mode,
+            streaming=self.video_streaming_mode and not self.static_hold.gated,
             use_paint_over_quality=self.use_paint_over_quality,
             capture_cursor=self.capture_cursor,
             cursor_size_cap_hint=int(self.get_cursor_size_cap() or 0),
@@ -570,11 +603,141 @@ class MediaPipelinePixel(MediaPipeline):
                     pts = self._last_video_pts + 1
                 self._last_video_pts = pts
                 self.async_event_loop.call_soon_threadsafe(
-                    self.produce_data, data_bytes, pts, "video", keyframe
+                    self._on_video_frame, data_bytes, pts, keyframe,
+                    bytes(view[:STRIPE_HEADER_LEN]), now
                 )
 
         except Exception as e:
             logger.error(f"Error in capture callback: {e}", exc_info=False)
+
+    def _on_video_frame(self, data: Any, pts: int, keyframe: bool, header: bytes,
+                        delivered_at: float) -> None:
+        """One encoded frame on the loop: sent first, then classified by the
+        static hold, whose lateness gate reads the hop from the capture thread.
+        A frame can move the hold's next deadline earlier, so it wakes the
+        hold's timer task."""
+        self.produce_data(data, pts, "video", keyframe)
+        try:
+            self.static_hold.frame(header, data, time.monotonic() - delivered_at)
+        except Exception:
+            logger.warning("Static hold failed on a frame", exc_info=True)
+            self.static_hold.disable("frame")
+        if self.static_hold.active:
+            self._hold_wakeup.set()
+
+    def _hold_scope(self) -> Optional[str]:
+        """Why this display's stream cannot be held, None when it can: only
+        x264 in CBR streaming mode, without paint-over, scheduled keyframes or
+        4:4:4, on X11, with an encoder QP floor, at the minimum frame rate or
+        above, while the capture runs."""
+        if self.encoder != "h264enc" or software_h264_encoder() != "x264":
+            return "encoder"
+        if self.rc_mode != RateControlMode.CBR:
+            return "rate-control"
+        if not self.video_streaming_mode:
+            return "streaming-mode"
+        if self.use_paint_over_quality:
+            return "paint-over"
+        if float(getattr(app_settings, "keyframe_interval", 0) or 0):
+            return "keyframe-interval"
+        if self.video_fullcolor:
+            return "fullcolor"
+        if bool(app_settings.wayland[0]):
+            return "wayland"
+        if self.static_hold.floor <= 0:
+            return "min-qp"
+        if self.framerate < HOLD_CONFIG["min_fps"]:
+            return "fps"
+        if not self._is_screen_capturing or self.capture_module is None:
+            return "capture"
+        return None
+
+    def _hold_push(self, gated: bool) -> bool:
+        """Push the hold's effective streaming flag to the live capture; False
+        when there is none. A failed push schedules a capture restart, which
+        starts from a streaming snapshot, and re-raises for the hold to disable
+        itself."""
+        if not self._is_screen_capturing or self.capture_module is None:
+            return False
+        try:
+            self.capture_module.update_tunables(self.generate_capture_settings())
+        except Exception:
+            self._hold_restart = asyncio.ensure_future(self.restart_screen_capture())
+            raise
+        if self.static_hold.active and (self._hold_task is None or self._hold_task.done()):
+            self._hold_task = asyncio.ensure_future(self._hold_run())
+        self._hold_wakeup.set()
+        return True
+
+    async def _hold_run(self) -> None:
+        """Keepalive, probe and padding timers of a held display; ends when
+        the hold streams again. Every frame and push wakes it early (the hold
+        ignores a tick before its deadline) and it sleeps again to the next
+        deadline, which either may have moved earlier. A failure disables the
+        hold, which then streams."""
+        hold = self.static_hold
+        try:
+            while (due := hold.next_due()) is not None:
+                self._hold_wakeup.clear()
+                try:
+                    await asyncio.wait_for(self._hold_wakeup.wait(), max(0.0, due - hold.clock()))
+                except asyncio.TimeoutError:
+                    pass
+                boundary = hold.tick()
+                if boundary is not None and self.on_hold_padding is not None:
+                    await self.on_hold_padding(boundary)
+        except Exception:
+            logger.warning("Static hold timer task failed", exc_info=True)
+            hold.disable("task")
+
+    def _hold_housekeeping(self) -> None:
+        """The hold's once-a-second chain while the capture runs: CPU throttling
+        sample, silence self-heal and the periodic report."""
+        self._hold_timer = None
+        if not self._is_screen_capturing:
+            return
+        try:
+            line = self.static_hold.housekeeping(read_nr_throttled())
+            if line:
+                logger.info(line)
+        except Exception:
+            logger.warning("Static hold housekeeping failed", exc_info=True)
+            self.static_hold.disable("housekeeping")
+        self._hold_timer = self.async_event_loop.call_later(
+            HOLD_HOUSEKEEPING_S, self._hold_housekeeping)
+
+    def _push_after_start(self) -> None:
+        """pixelflux drops live pushes while a capture (re)starts: push the
+        current tunables and, in CBR, the bitrate once more."""
+        self.capture_module.update_tunables(self.generate_capture_settings())
+        if self.rc_mode == RateControlMode.CBR:
+            self.capture_module.update_video_bitrate(int(self.video_bitrate))
+
+    def _hold_resume(self, settings: Any) -> None:
+        """A capture (re)started from `settings`: latch its QP floor and run
+        the housekeeping chain."""
+        self.static_hold.resume(int(settings.video_min_qp))
+        if self.static_hold.mode != "off" and self._hold_timer is None:
+            self._hold_timer = self.async_event_loop.call_later(
+                HOLD_HOUSEKEEPING_S, self._hold_housekeeping)
+
+    def _hold_stop(self) -> None:
+        """Forget the hold's stream and stop its timers, ahead of a capture stop."""
+        self.static_hold.suspend()
+        if self._hold_task is not None:
+            self._hold_task.cancel()
+            self._hold_task = None
+        if self._hold_timer is not None:
+            self._hold_timer.cancel()
+            self._hold_timer = None
+
+    def wake_static_hold(self, reason: str) -> None:
+        """Content is about to change (resize): stream again at once."""
+        self.static_hold.wake(reason)
+
+    def static_hold_reevaluate(self, reason: str, peer_id: Optional[str] = None) -> None:
+        """The display's consumers changed: re-check the hold's eligibility."""
+        self.static_hold.reevaluate(reason, peer_id)
 
     def _pixelflux_cursor_handler(
         self, msg_type: str, data_bytes: Optional[bytes], hot_x: int, hot_y: int
@@ -599,6 +762,8 @@ class MediaPipelinePixel(MediaPipeline):
         pixelflux is the cursor source on both backends (compositor on
         Wayland, XFixes monitor on X11); an older X11-only build stashes the
         callback harmlessly and the input handler's monitor keeps delivering.
+        A setting changed while the start runs skips its live push, so the
+        current tunables and bitrate are pushed once more after it.
 
         Raises:
             MediaPipelineError: When pixelflux is unavailable or the capture
@@ -614,6 +779,7 @@ class MediaPipelinePixel(MediaPipeline):
                 "cannot start screen capture"
             )
 
+        self._hold_stop()
         settings = self.generate_capture_settings()
 
         try:
@@ -631,6 +797,11 @@ class MediaPipelinePixel(MediaPipeline):
             self.capture_module = None
             self._is_screen_capturing = False
             raise MediaPipelineError(f"screen capture failed to start: {e}") from e
+        self._hold_resume(settings)
+        try:
+            self._push_after_start()
+        except Exception as e:
+            logger.warning(f"Pushing the settings after the capture start failed: {e}")
 
     async def update_capture_region(self, x: int, y: int, w: int, h: int) -> None:
         """Re-target the capture to a new region of the extended framebuffer.
@@ -639,6 +810,7 @@ class MediaPipelinePixel(MediaPipeline):
         region and a start on the live module reconfigures it in place, so it
         restarts; so does a failed live re-target or one with no live capture.
         """
+        self.static_hold.wake("region")
         self.capture_region = (int(x), int(y))
         self.width, self.height = int(w), int(h)
         if (self._is_screen_capturing and self.capture_module is not None
@@ -654,9 +826,11 @@ class MediaPipelinePixel(MediaPipeline):
 
     async def stop_screen_capture(self) -> None:
         """Stop the pixelflux capture, dropping the module and its cursor
-        callback even on error."""
+        callback even on error. The hold's timers stop before and again after
+        the await, which a housekeeping tick may re-arm."""
         if not self._is_screen_capturing or self.capture_module is None:
             return
+        self._hold_stop()
         release_pixelflux_cursor_callback(self.capture_module)
         try:
             await asyncio.to_thread(self.capture_module.stop_capture)
@@ -667,6 +841,7 @@ class MediaPipelinePixel(MediaPipeline):
             logger.error(f"Error stopping screen capture: {e}", exc_info=True)
             self.capture_module = None
             self._is_screen_capturing = False
+        self._hold_stop()
 
     async def pause_screen_capture(self) -> bool:
         """Consumer-aware pause: stop only the screen capture (audio and the
@@ -729,18 +904,24 @@ class MediaPipelinePixel(MediaPipeline):
         capture internally). Only structural changes land here; rate/quality
         knobs go through the live `update_*` paths. The running check is
         made under the lock so a capture stopped by a concurrent
-        `stop_media_pipeline` is not resurrected.
+        `stop_media_pipeline` is not resurrected. pixelflux drops live pushes
+        while it restarts, so the current tunables and bitrate are pushed once
+        more after it, as after a start (the hold starts again from streaming;
+        a failed restart leaves it suspended).
         """
         async with self.async_lock:
             if not self._is_screen_capturing:
                 return
             try:
+                self._hold_stop()
                 settings = self.generate_capture_settings()
                 await asyncio.to_thread(
                     self.capture_module.start_capture,
                     self._screen_capture_callback,
                     settings,
                 )
+                self._hold_resume(settings)
+                self._push_after_start()
                 logger.info("Screen capture reconfigured")
             except Exception as e:
                 logger.error(f"Error restarting screen capture: {e}")

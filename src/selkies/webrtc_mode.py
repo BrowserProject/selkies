@@ -65,6 +65,7 @@ from .display_utils import (resize_display, set_dpi, set_cursor_size, parse_gpu_
                             parse_resize_dims, cursor_size_for_dpi, align_dims_16)
 from .webrtc_utils import SystemMonitor, Metrics, GPUMonitor, get_rtc_configuration
 from .ws_sink import WsSink
+from .stream_hold import LinkSample
 from .settings import (settings, AppSettings, SETTING_DEFINITIONS,
                        build_client_settings_payload, sanitize_client_setting)
 from types import SimpleNamespace
@@ -585,8 +586,11 @@ class WebRTCService(BaseStreamingService):
 
         self.media_pipeline.produce_data = self.rtc_app.consume_data
         self.media_pipeline.on_pipeline_started = self.send_current_cursor
+        self.media_pipeline.get_hold_link = lambda: self._hold_link("primary")
+        self.media_pipeline.on_hold_padding = lambda since: self._hold_padding("primary", since)
 
         self.rtc_app.request_idr_frame = self.request_idr_for_display
+        self.rtc_app.on_path_protocol = self._hold_path_changed
         self.rtc_app.start_display_media = self.start_display_media
         self.rtc_app.stop_display_media = self.stop_display_media
         self.rtc_app.on_sdp = self.signaling_client.send_sdp
@@ -1026,6 +1030,7 @@ class WebRTCService(BaseStreamingService):
                     logger.info(f"resize_display('{target_w}x{target_h}') reported success")
                 # A zero-size region re-reads the live root now and keeps root-follow;
                 # the auto-adjust poll trails ~30 frames, leaving new bands out of frame.
+                self.media_pipeline.wake_static_hold("resize")
                 capture_module = getattr(self.media_pipeline, "capture_module", None)
                 if capture_module is not None:
                     try:
@@ -1053,14 +1058,16 @@ class WebRTCService(BaseStreamingService):
             if self.media_pipeline:
                 self.media_pipeline.last_resize_success = False
 
-    async def request_idr_for_display(self, display_id: str = "primary") -> None:
+    async def request_idr_for_display(self, display_id: str = "primary", reason: str = "request",
+                                      peer_id: Optional[str] = None) -> None:
         """Schedule a dynamic IDR frame on the display's encoder, throttled by a
         per-display floor (websockets REQUEST_KEYFRAME parity).
 
         Any number of viewers share one encoder, and an unthrottled
         data-channel request or PLI storm would let a single client force
         keyframe bursts for every consumer. A request landing inside the floor
-        is satisfied by the IDR the previous request already scheduled.
+        is satisfied by the IDR the previous request already scheduled. The
+        reason and the requesting peer reach the display's static hold.
         """
         display_id = display_id or "primary"
         now = time.monotonic()
@@ -1069,7 +1076,48 @@ class WebRTCService(BaseStreamingService):
         self._last_idr_request_times[display_id] = now
         pipeline = self.display_pipelines.get(display_id)
         if pipeline is not None:
-            await pipeline.dynamic_idr_frame()
+            await pipeline.dynamic_idr_frame(reason, peer_id)
+
+    def _hold_link(self, display_id: str) -> Tuple[List[LinkSample], List[Dict[str, Any]]]:
+        """The static hold's view of a display's links: one sample per
+        unpaused peer (a peer without a receiver report yet is still listed,
+        which keeps the display streaming) and the unpaused sink clients."""
+        samples = []
+        if self.rtc_app is not None:
+            for peer_id, peer in self.rtc_app.peer_connections.items():
+                if (peer.get("display_id") or "primary") != display_id or peer.get("video_paused"):
+                    continue
+                sender = peer.get("video_sender")
+                link = sender.link_sample() if sender is not None else None
+                samples.append(LinkSample(peer_id, peer.get("path_protocol"), *(link or ())))
+        sinks = []
+        if self.ws_sink is not None:
+            sinks = [c for c in self.ws_sink.display_consumers(display_id)
+                     if not c.get("video_paused")]
+        return samples, sinks
+
+    async def _hold_padding(self, display_id: str, since: float) -> None:
+        """One padding packet to every unpaused video sender of a held display
+        that sent nothing since `since`, the padding tick's boundary."""
+        if self.rtc_app is None:
+            return
+        for peer_id, peer in list(self.rtc_app.peer_connections.items()):
+            if (peer.get("display_id") or "primary") != display_id or peer.get("video_paused"):
+                continue
+            sender = peer.get("video_sender")
+            if sender is None:
+                continue
+            try:
+                await sender.send_padding(since)
+            except Exception:
+                logger.debug(f"Padding for peer {peer_id} failed", exc_info=True)
+
+    def _hold_path_changed(self, peer_id: str, display_id: str) -> None:
+        """A viewer reported a new path protocol: the hold of its display
+        re-checks its link verdict at once."""
+        pipeline = self.display_pipelines.get(display_id)
+        if pipeline is not None:
+            pipeline.static_hold_reevaluate("path", peer_id)
 
     async def _provision_webrtc_virtual_mic(self) -> None:
         """Bring up the SelkiesVirtualMic once for the WebRTC transport (shared
@@ -1522,6 +1570,8 @@ class WebRTCService(BaseStreamingService):
         if pipeline is None:
             return
         if active:
+            # The resume IDR wakes the hold; the peer starts its fault grace again.
+            pipeline.static_hold_reevaluate("resume", peer_id)
             await self._resume_display_capture(display_id, pipeline,
                                                "consumer resume", idr_always=True)
         elif all(p.get("video_paused", False) for p in self._display_consumers(display_id)):
@@ -1658,6 +1708,7 @@ class WebRTCService(BaseStreamingService):
         pipeline = self.display_pipelines.get(display_id)
         if pipeline is None:
             return
+        pipeline.static_hold_reevaluate("consumers")
         consumers = self._display_consumers(display_id)
         if not consumers:
             return
@@ -1955,6 +2006,8 @@ class WebRTCService(BaseStreamingService):
                     lambda buf, pts, kind, keyframe=True, _did=did:
                         self.rtc_app.consume_data(buf, pts, kind, keyframe, _did)
                 )
+                pipeline.get_hold_link = lambda _did=did: self._hold_link(_did)
+                pipeline.on_hold_padding = lambda since, _did=did: self._hold_padding(_did, since)
                 # pixelflux's cursor-callback slot is process-global (last registration
                 # wins), so every display must route cursors into the same sink.
                 pipeline.on_cursor_data = self.media_pipeline.on_cursor_data

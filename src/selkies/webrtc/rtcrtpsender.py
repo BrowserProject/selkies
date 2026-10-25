@@ -80,6 +80,7 @@ from .stats import (
     RTCStatsReport,
 )
 from .utils import random16, random32, uint16_add, uint32_add
+from ..stream_hold import RTT_MAX_S, ReceiverLoss
 from pyee.asyncio import AsyncIOEventEmitter
 
 logger = logging.getLogger(__name__)
@@ -166,6 +167,15 @@ class RTCRtpSender(AsyncIOEventEmitter):
         self.__started = False
         self.__stats = RTCStatsReport()
         self.__transport = transport
+        # Media and padding share one sequence; a packet takes its number
+        # before any await, so neither can reuse the other's.
+        self.__seq = random_sequence_number()
+        self.__in_frame = False
+        self.__media_pt: Optional[int] = None
+        self.__clock_rate = 90000
+        self.__last_rtp_at: Optional[float] = None
+        self.__last_media_ts = 0
+        self.__last_media_at: Optional[float] = None
 
         # stats
         self.__lsr: Optional[int] = None
@@ -175,6 +185,14 @@ class RTCRtpSender(AsyncIOEventEmitter):
         self.__octet_count = 0
         self.__packet_count = 0
         self.__rtt: Optional[float] = None
+        # The static hold's link sample: the last raw RTT and when it came,
+        # receiver-report jitter (seconds), the packet loss over the recent
+        # reports, and when the last report came (monotonic).
+        self.__rtt_sample: Optional[float] = None
+        self.__rtt_sample_at: Optional[float] = None
+        self.__jitter_s: Optional[float] = None
+        self.__loss = ReceiverLoss()
+        self.__rr_at: Optional[float] = None
 
         # logging
         self.__log_debug: Callable[..., None] = lambda *args: None
@@ -310,13 +328,20 @@ class RTCRtpSender(AsyncIOEventEmitter):
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
         if isinstance(packet, (RtcpRrPacket, RtcpSrPacket)):
             for report in filter(lambda x: x.ssrc == self._ssrc, packet.reports):
-                # estimate round-trip time
+                now = time.monotonic()
+                # estimate round-trip time; wall-clock arithmetic, so a clock
+                # step can produce a sample that is no round trip at all
                 if self.__lsr == report.lsr and report.dlsr:
                     rtt = time.time() - self.__lsr_time - (report.dlsr / 65536)
-                    if self.__rtt is None:
-                        self.__rtt = rtt
-                    else:
-                        self.__rtt = RTT_ALPHA * self.__rtt + (1 - RTT_ALPHA) * rtt
+                    if 0 < rtt < RTT_MAX_S:
+                        self.__rtt_sample, self.__rtt_sample_at = rtt, now
+                        if self.__rtt is None:
+                            self.__rtt = rtt
+                        else:
+                            self.__rtt = RTT_ALPHA * self.__rtt + (1 - RTT_ALPHA) * rtt
+                self.__jitter_s = report.jitter / self.__clock_rate
+                self.__loss.report(now, report.highest_sequence, report.packets_lost)
+                self.__rr_at = now
 
                 self.__stats.add(
                     RTCRemoteInboundRtpStreamStats(
@@ -339,6 +364,7 @@ class RTCRtpSender(AsyncIOEventEmitter):
                 )
         elif isinstance(packet, RtcpRtpfbPacket) and packet.fmt == RTCP_RTPFB_NACK:
             for seq in packet.lost:
+                self.__loss.nack(seq)
                 await self._retransmit(seq)
         elif isinstance(packet, RtcpRtpfbPacket) and packet.fmt == RTCP_RTPFB_TWCC:
             self.transport._twcc_process_feedback(packet.fci)
@@ -429,11 +455,69 @@ class RTCRtpSender(AsyncIOEventEmitter):
         """Public alias used by the transport pacer's GOP-reset recovery hook."""
         self._send_keyframe()
 
+    def link_sample(self) -> Optional[tuple]:
+        """`(smoothed RTT, last raw RTT, raw RTT age, jitter, loss, report age)`
+        in seconds (loss a fraction) for the static hold, None before the first
+        receiver report. RTT and its age are None until a report matched an SR,
+        the loss until the reports cover enough packets."""
+        if self.__rr_at is None:
+            return None
+        now = time.monotonic()
+        rtt_age = None if self.__rtt_sample_at is None else now - self.__rtt_sample_at
+        return (self.__rtt, self.__rtt_sample, rtt_age, self.__jitter_s, self.__loss.rate(),
+                now - self.__rr_at)
+
+    async def send_padding(self, since: float) -> bool:
+        """Send one empty RTP padding packet on the media stream of a held
+        display, unless this video sender is disabled, stopped, inside a frame,
+        has sent no media yet, or already sent a packet at or after `since`
+        (the padding tick's boundary, monotonic).
+
+        The packet takes the next media sequence number and goes into the
+        retransmission history, so its loss is detected and repaired like a
+        media packet's (a receiver holds every later frame until the gap is
+        filled). Its timestamp runs on from the last media timestamp, so the
+        receiver's jitter estimate sees no gap. It is counted as a packet sent,
+        and leaves the sender report's RTP/NTP mapping untouched.
+
+        Returns:
+            Whether a packet was sent.
+        """
+        if (self.__kind != "video" or not self.__started or self.__rtp_exited.is_set()
+                or not self._enabled or self.__in_frame or self.__last_media_at is None):
+            return False
+        if self.__last_rtp_at >= since:
+            return False
+        now = time.monotonic()
+        packet = RtpPacket(
+            payload_type=self.__media_pt,
+            sequence_number=self.__seq,
+            timestamp=uint32_add(self.__last_media_ts,
+                                 int((now - self.__last_media_at) * self.__clock_rate)),
+        )
+        self.__seq = uint16_add(self.__seq, 1)
+        packet.ssrc = self._ssrc
+        packet.padding_size = 1
+        packet.extensions.abs_send_time = (clock.current_ntp_time() >> 14) & 0x00FFFFFF
+        packet.extensions.mid = self.__mid
+        if self.__rtp_header_extensions_map.transport_sequence_number_enabled:
+            packet.extensions.transport_sequence_number = self.transport._twcc_next(0)
+        self.__rtp_history.add(packet, time.time())
+        self.__last_rtp_at = now
+        self.__packet_count += 1
+        try:
+            await self.transport._send_rtp(
+                packet.serialize(self.__rtp_header_extensions_map), rtc_class=CLASS_VIDEO)
+        except ConnectionError:
+            return False
+        return True
+
     async def _run_rtp(self, codec: RTCRtpCodecParameters) -> None:
         self.__log_debug("- RTP started")
         self.__rtp_started.set()
 
-        sequence_number = random_sequence_number()
+        self.__media_pt = codec.payloadType
+        self.__clock_rate = codec.clockRate
         timestamp_origin = random32()
         # Timer-triggered video-timing diagnostics (~5 flagged frames/s, like libwebrtc).
         last_video_timing = 0.0
@@ -473,12 +557,15 @@ class RTCRtpSender(AsyncIOEventEmitter):
                 if self.__kind == "video" and enc_frame.keyframe:
                     # Old GOP retransmissions compete with the recovery frame for the same link.
                     self.__rtp_history = RtpHistory()
+                # No padding between the packets of a frame, awaited sends included.
+                self.__in_frame = True
                 for i, payload in enumerate(enc_frame.payloads):
                     packet = RtpPacket(
                         payload_type=codec.payloadType,
-                        sequence_number=sequence_number,
+                        sequence_number=self.__seq,
                         timestamp=timestamp,
                     )
+                    self.__seq = uint16_add(self.__seq, 1)
                     packet.ssrc = self._ssrc
                     packet.payload = payload
                     packet.marker = (i == len(enc_frame.payloads) - 1) and 1 or 0
@@ -527,7 +614,8 @@ class RTCRtpSender(AsyncIOEventEmitter):
                     self.__rtp_timestamp = packet.timestamp
                     self.__octet_count += len(payload)
                     self.__packet_count += 1
-                    sequence_number = uint16_add(sequence_number, 1)
+                    self.__last_media_ts = packet.timestamp
+                    self.__last_media_at = self.__last_rtp_at = time.monotonic()
 
                     if self.__fec_payload_type is not None:
                         if not fec_group:
@@ -548,6 +636,7 @@ class RTCRtpSender(AsyncIOEventEmitter):
                             )
                             fec_group = []
                             await self.transport._send_rtp(fec_bytes, rtc_class=CLASS_VIDEO)
+                self.__in_frame = False
         except (asyncio.CancelledError, ConnectionError, MediaStreamError):
             pass
         except Exception:

@@ -2546,6 +2546,11 @@ def parse_dri_node_to_index(node_path: str) -> int:
         return -1
 
 
+# (display, encoder) pairs whose software encoding was logged: every settings
+# snapshot passes here, several a second while a static hold toggles.
+_SOFTWARE_ENCODE_LOGGED: set = set()
+
+
 def apply_common_capture_settings(
     cs: Any,
     server: Any,
@@ -2620,7 +2625,8 @@ def apply_common_capture_settings(
     from .stream_control import vbv_frames
     cs.video_vbv_multiplier = vbv_frames(framerate)
     cs.use_cpu = bool(use_cpu)
-    if cs.use_cpu and encoder != "jpeg":
+    if cs.use_cpu and encoder != "jpeg" and (display_name, encoder) not in _SOFTWARE_ENCODE_LOGGED:
+        _SOFTWARE_ENCODE_LOGGED.add((display_name, encoder))
         from .settings import software_h264_encoder
         logging.getLogger("display_utils").info(
             f"Display '{display_name}' encodes H.264 in software ({software_h264_encoder()}).")
