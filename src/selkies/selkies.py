@@ -1110,6 +1110,8 @@ class DataStreamingServer(BaseStreamingService):
         self.RECONNECT_DEBOUNCE_MS = 500
         self.RECONNECT_GRACE_S = 3.0
         self._display_teardown_tasks = set()
+        self._ws_handler_tasks = set()
+        self._accepting_ws_handlers = False
         self.MAX_RECENT_CLIENTS = 1000
         self.last_connection_times = OrderedDict()
         self._latest_client_render_fps = 0.0
@@ -5736,6 +5738,7 @@ class DataStreamingServer(BaseStreamingService):
             logger.info("Shutdown already called, skipping")
             return
         self._shutdown_called = True
+        self._accepting_ws_handlers = False
         logger.info("DataStreamingServer shutdown initiated...")
 
         sockets_to_close = set(self.clients)
@@ -5754,6 +5757,37 @@ class DataStreamingServer(BaseStreamingService):
             await asyncio.gather(
                 *[_close_one(s) for s in sockets_to_close], return_exceptions=True
             )
+
+        async def _cancel_teardown_tasks():
+            teardown_tasks = {
+                task for task in self._display_teardown_tasks if not task.done()
+            }
+            for task in teardown_tasks:
+                task.cancel()
+            if teardown_tasks:
+                await asyncio.gather(*teardown_tasks, return_exceptions=True)
+
+        # A grace task may own a lock a closing handler needs in its finally block.
+        await _cancel_teardown_tasks()
+
+        current_task = asyncio.current_task()
+        handler_tasks = {
+            task for task in self._ws_handler_tasks
+            if task is not current_task and not task.done()
+        }
+        if handler_tasks:
+            _, pending = await asyncio.wait(
+                handler_tasks, timeout=self.RECONNECT_GRACE_S
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        self._ws_handler_tasks.clear()
+
+        # Handler cleanup may have scheduled a new reconnect grace task.
+        await _cancel_teardown_tasks()
+        self._display_teardown_tasks.clear()
 
         try:
             await self.shutdown_pipelines()
@@ -5814,9 +5848,11 @@ class DataStreamingServer(BaseStreamingService):
 
     async def start(self) -> None:
         self.shutdown_event.clear()
+        self._accepting_ws_handlers = True
         await self.run()
 
     async def stop(self) -> None:
+        self._accepting_ws_handlers = False
         self.shutdown_event.set()
 
     def register_routes(self, api_prefix: str, main_router: web.UrlDispatcher) -> None:
@@ -5877,7 +5913,8 @@ class DataStreamingServer(BaseStreamingService):
         the query string asks for (legacy, non-secure mode); secure mode leaves
         the ceiling unset and lets the token govern.
         """
-        if self.supervisor.current_mode != self.mode:
+        if (self.supervisor.current_mode != self.mode
+                or not self._accepting_ws_handlers):
             return web.Response(status=409, text="WebSocket mode is inactive")
 
         token = ""
@@ -5890,7 +5927,20 @@ class DataStreamingServer(BaseStreamingService):
         # protocol pings reap a silently dead peer, as the signaling sockets' probes
         # do. autoping=False: the loop answers PING and feeds PONG to the uplink gauge.
         ws = web.WebSocketResponse(compress=False, max_msg_size=WS_MAX_MESSAGE_BYTES, heartbeat=30, autoping=False)
-        await ws.prepare(request)
+        handler_task = asyncio.current_task()
+        if handler_task is not None:
+            self._ws_handler_tasks.add(handler_task)
+        try:
+            await ws.prepare(request)
+        except BaseException:
+            if handler_task is not None:
+                self._ws_handler_tasks.discard(handler_task)
+            raise
+        if not self._accepting_ws_handlers:
+            await ws.close(code=4000, message=b"server shutting down")
+            if handler_task is not None:
+                self._ws_handler_tasks.discard(handler_task)
+            return ws
 
         peername = request.transport.get_extra_info('peername')
         remote_address = peername[:2] if peername else (request.remote, 0)
@@ -5902,7 +5952,11 @@ class DataStreamingServer(BaseStreamingService):
         try:
             await self.ws_handler(ws, remote_address, token, query_role=query_role, query_slot=query_slot)
         finally:
-            self._report_client_presence()
+            try:
+                self._report_client_presence()
+            finally:
+                if handler_task is not None:
+                    self._ws_handler_tasks.discard(handler_task)
         return ws
 
     def uplink_session_conns(self) -> list[tuple[Any, Optional[str], Optional[str]]]:
