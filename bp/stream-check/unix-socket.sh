@@ -4,7 +4,8 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Inside the test environment: Selkies listening on upstream's
-# SELKIES_UNIX_SOCKET answers GET / over the socket.
+# SELKIES_UNIX_SOCKET serves its HTTP routes over the socket. The wheel has no
+# web bundle, so GET / is a 404 from Selkies; GET /api/status must be 200.
 set -eu
 pip install --no-cache-dir --quiet /wheel/*.whl
 cp -r /ext /tmp/ext && pip install --no-cache-dir --quiet /tmp/ext
@@ -28,7 +29,6 @@ async def main():
             try:
                 async with s.get("http://selkies/") as root, s.get("http://selkies/api/status") as status:
                     body = await status.json()
-                    # Without the upstream web bundle / has no page: any HTTP answer is the server.
                     print(f"UNIX GET / {root.status}, GET /api/status {status.status} {json.dumps(body)[:160]}")
                     sys.exit(0 if status.status == 200 and root.status < 500 else 1)
             except aiohttp.ClientError:
