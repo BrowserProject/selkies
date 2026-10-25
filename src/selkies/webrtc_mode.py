@@ -80,6 +80,10 @@ logger = logging.getLogger("webrtc")
 # WebSocket idle for about 15 s; both ends take a lost signaling socket for a
 # dead peer and would tear down and rebuild a healthy WebRTC stream.
 SIGNALING_KEEPALIVE_S = 10
+# Signaling close for a peer the container ended itself; the viewer falls back
+# at once instead of waiting out its own ICE timers on a frozen picture.
+PEER_CLOSED_CLOSE_CODE = 4003
+PEER_CLOSED_CLOSE_REASON = b"Peer connection closed"
 
 
 def _selkies_is_aioice_frame_chain(exc: BaseException) -> bool:
@@ -609,6 +613,7 @@ class WebRTCService(BaseStreamingService):
         self.rtc_app.on_data_error = lambda e: logger.error(f"Data channel error: {e}")
         self.rtc_app.on_data_message = self.input_handler.on_message
         self.rtc_app.on_peer_gone = self.handle_peer_gone
+        self.rtc_app.on_peer_closed = self.handle_peer_closed
         self.input_handler.on_request_keyframe = self.request_idr_for_display
 
         self.input_handler.on_cursor_change = self._fanout_cursor
@@ -1589,6 +1594,16 @@ class WebRTCService(BaseStreamingService):
             except Exception as e:
                 logger.warning(f"Input release for departed peer {peer_id} failed: {e}")
 
+    async def handle_peer_closed(self, peer_id: str) -> None:
+        """Tell the viewer of a peer the container ended on its own (ICE
+        consent expired, a failed transport) by closing its signaling socket
+        with PEER_CLOSED_CLOSE_CODE. Nothing else reaches it: the media path is
+        gone, and its signaling socket stays open and paired otherwise. A peer
+        the viewer closed itself usually reaches this with its signaling
+        already gone, and then nothing is sent or logged."""
+        if await self._close_peer_signaling_ws(peer_id, PEER_CLOSED_CLOSE_CODE, PEER_CLOSED_CLOSE_REASON):
+            logger.info(f"Closed signaling of peer {peer_id} with {PEER_CLOSED_CLOSE_CODE}: its connection ended on the server")
+
     async def handle_video_consumer_active(self, peer_id: str, display_id: str, active: bool) -> None:
         """Tab-visibility pause/resume for ONE peer (data-channel STOP_VIDEO /
         START_VIDEO, websockets parity). The peer's own RTP sender gates its
@@ -1660,19 +1675,22 @@ class WebRTCService(BaseStreamingService):
                     logger.info("No peer receives video; capture stopped.")
         await self._settle_primary_audio()
 
-    async def _close_peer_signaling_ws(self, peer_id: str, code: int, message: bytes) -> None:
+    async def _close_peer_signaling_ws(self, peer_id: str, code: int, message: bytes) -> bool:
         """Fatal verdict on ONE peer's signaling socket (websockets KILL parity);
-        bounded so a wedged socket cannot stall the caller."""
+        bounded so a wedged socket cannot stall the caller. False when the
+        peer's signaling socket was already gone."""
         if self.peer_manager is None:
-            return
+            return False
         async with self.peer_manager.lock:
             peer = self.peer_manager.peers.get(peer_id)
             peer_ws = getattr(peer, "ws", None) if peer is not None else None
-        if peer_ws is not None and not peer_ws.closed:
-            try:
-                await asyncio.wait_for(peer_ws.close(code=code, message=message), timeout=2.0)
-            except Exception:
-                pass
+        if peer_ws is None or peer_ws.closed:
+            return False
+        try:
+            await asyncio.wait_for(peer_ws.close(code=code, message=message), timeout=2.0)
+        except Exception:
+            pass
+        return True
 
     async def reconcile_webrtc_peers(self) -> None:
         """Token-update reconciliation for LIVE WebRTC peers (websockets

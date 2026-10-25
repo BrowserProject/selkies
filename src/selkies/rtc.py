@@ -477,6 +477,10 @@ class RTCApp:
             reaches closed: the id releases per-connection input state
             (gamepad associations) after an ungraceful disconnect, the entry
             says what input authority left with it.
+        on_peer_closed: Async hook called with the peer id once the
+            container itself ended a peer (ICE consent expired, a transport
+            failed) and reaped it, so the viewer can be told at once instead
+            of finding out from its own ICE timers.
         on_ice: ICE candidate to send over signaling.
         on_sdp: SDP offer to send over signaling.
         request_idr_frame: Async keyframe request for a display.
@@ -533,6 +537,7 @@ class RTCApp:
         self.on_data_error = lambda e=None: logger.warning('unhandled on_data_error')
         self.on_data_message = lambda msg, display_id='primary', conn_id=None: logger.warning('unhandled on_data_message')
         self.on_peer_gone = None
+        self.on_peer_closed = None
 
         self.on_ice = lambda ice, client_peer_id: logger.warning('unhandled ice event')
         self.on_sdp = lambda sdp_type, sdp, client_peer_id: logger.warning('unhandled sdp event')
@@ -1740,6 +1745,11 @@ class RTCApp:
             self.peer_connections.pop(client_peer_id, None)
             await self._reap_peer(client_peer_id, peer_obj)
             logger.info("Peer connection closed", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
+            if self.on_peer_closed is not None:
+                try:
+                    await self.on_peer_closed(client_peer_id)
+                except Exception:
+                    logger.exception("on_peer_closed hook failed")
         elif state == "connecting":
             logger.info("Peer connection is connecting", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
         else:
