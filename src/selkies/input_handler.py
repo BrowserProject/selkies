@@ -65,6 +65,7 @@ stalls behind a slow display server.
 import ctypes
 import fcntl
 from collections import deque
+from dataclasses import dataclass, field
 import functools
 import logging
 import select
@@ -1896,6 +1897,32 @@ logger_selkies_gamepad = logging.getLogger("selkies_gamepad")
 # accumulated chunks are both checked so a client cannot balloon memory.
 MULTIPART_CLIPBOARD_MAX_SIZE = 64 * 1024 * 1024
 
+# Multi-part receives in flight at once, one per connection, each up to
+# MULTIPART_CLIPBOARD_MAX_SIZE. A viewer handing over from its socket to WebRTC
+# briefly sends on both connections.
+MULTIPART_CLIPBOARD_MAX_TRANSFERS = 4
+
+
+@dataclass
+class ClipboardTransfer:
+    """One connection's multi-part clipboard receive (`cws`/`cbs`, chunks, end).
+
+    Attributes:
+        transfer_id: The id the client numbers its transfers with; every
+            client starts at the same value, so it is unique only within
+            its own connection.
+        kind: "text" (`cw*`) or "binary" (`cb*`).
+        mime_type: The type the finished content is written as.
+        declared_size: Bytes the start message announced; the chunks may
+            neither exceed nor fall short of it.
+        buffer: The chunks received so far.
+    """
+    transfer_id: str
+    kind: str
+    mime_type: str
+    declared_size: int
+    buffer: io.BytesIO = field(default_factory=io.BytesIO)
+
 # Re-reads the outbound monitor gives one selection-change edge whose read came
 # back empty, before treating the selection as genuinely empty.
 _CLIPBOARD_REREAD_ATTEMPTS = 2
@@ -3565,6 +3592,12 @@ class WebRTCInput:
         _last_clipboard_request_ts: REQUEST_CLIPBOARD (Ctrl/Cmd+C) debounce,
             keyed per requesting connection so a keypress storm cannot stack
             clipboard reads and one client's copy cannot suppress another's.
+        _clipboard_transfers: Connection to its multi-part clipboard receive
+            (`ClipboardTransfer`), oldest first. Keyed per connection because
+            clients number their transfers alike: two connections pasting at
+            once (a viewer handing over between transports) must not write
+            into one buffer. Dropped when the connection goes
+            (`release_clipboard_for_conn`).
         _bg_tasks: Strong refs for fire-and-forget tasks; asyncio holds running
             tasks weakly, so an unreferenced one can be collected mid-flight.
         _wl_text_routed: Keysyms whose kd became buffered text on the Wayland
@@ -3717,12 +3750,7 @@ class WebRTCInput:
             logger_webrtc_input.debug(f"unhandled on_client_webrtc_stats: {webrtc_stat_type}")
         self.on_client_webrtc_stats = _unhandled_webrtc_stats
         self.clipboard_monitor_task = None
-        self.multipart_clipboard_buffer = None
-        self.multipart_clipboard_mime_type = "text/plain"
-        self.multipart_clipboard_total_size = 0
-        self.multipart_clipboard_in_progress = False
-        self.multipart_clipboard_id = None
-        self.multipart_clipboard_kind = None
+        self._clipboard_transfers = {}
         self.data_server_instance = data_server_instance
         self.on_update_settings = lambda settings_json, display_id="primary": logger_webrtc_input.warning("unhandled update_settings")
         self.is_wayland = is_wayland
@@ -4257,7 +4285,7 @@ class WebRTCInput:
         self.pressed_keys.clear()
         self.reaped_atomic_keys.clear()
         self.key_repeat_state.clear()
-        self._reset_multipart_clipboard()
+        self._clipboard_transfers.clear()
 
     async def _key_stale_sweep(self) -> None:
         """Auto-release keys and neutralize gamepads whose heartbeats stopped,
@@ -7439,18 +7467,36 @@ class WebRTCInput:
             except Exception as e:
                 logger_webrtc_input.error(f"Error in keyboard worker: {e}", exc_info=True)
 
-    def _reset_multipart_clipboard(self) -> None:
-        """Reset all multi-part clipboard receive state to its idle defaults.
+    def _start_clipboard_transfer(self, conn_id: Any, transfer: ClipboardTransfer) -> None:
+        """Open a connection's multi-part receive, replacing its unfinished one.
 
-        Used on completion/abort so no field (size, mime type, buffer, id, kind)
-        is left stale to bleed into the next cbs/cws transfer.
+        At MULTIPART_CLIPBOARD_MAX_TRANSFERS the oldest receive is dropped, so
+        connections that start transfers and never end them cannot hold more
+        than that many buffers.
         """
-        self.multipart_clipboard_buffer = None
-        self.multipart_clipboard_in_progress = False
-        self.multipart_clipboard_id = None
-        self.multipart_clipboard_kind = None
-        self.multipart_clipboard_total_size = 0
-        self.multipart_clipboard_mime_type = "text/plain"
+        previous = self._clipboard_transfers.pop(conn_id, None)
+        if previous is not None and previous.transfer_id != transfer.transfer_id:
+            logger_webrtc_input.warning(f"Aborting previous in-progress clipboard transfer {previous.transfer_id} for new transfer {transfer.transfer_id}.")
+        while len(self._clipboard_transfers) >= MULTIPART_CLIPBOARD_MAX_TRANSFERS:
+            oldest = next(iter(self._clipboard_transfers))
+            dropped = self._clipboard_transfers.pop(oldest)
+            logger_webrtc_input.warning(f"Dropping in-progress clipboard transfer {dropped.transfer_id}: {MULTIPART_CLIPBOARD_MAX_TRANSFERS} transfers already in progress.")
+        self._clipboard_transfers[conn_id] = transfer
+
+    def _active_clipboard_transfer(self, conn_id: Any, transfer_id: str,
+                                   kind: str) -> Optional[ClipboardTransfer]:
+        """The connection's open receive when a chunk or end names it, else None."""
+        transfer = self._clipboard_transfers.get(conn_id)
+        if transfer is None or transfer.transfer_id != transfer_id or transfer.kind != kind:
+            return None
+        return transfer
+
+    def release_clipboard_for_conn(self, conn_id: Any) -> None:
+        """Forget a departed connection's clipboard state: its unfinished
+        multi-part receive and its REQUEST_CLIPBOARD debounce stamp. Called by
+        each transport's connection teardown, next to the gamepad release."""
+        self._clipboard_transfers.pop(conn_id, None)
+        self._last_clipboard_request_ts.pop(conn_id, None)
 
     async def on_message(self, msg: str, display_id: str = 'primary',
                          conn_id: Any = None) -> None:
@@ -7464,7 +7510,7 @@ class WebRTCInput:
             display_id: Transport-level id of the display whose channel
                 delivered the message (not a spoofable payload field).
             conn_id: Transport connection identity, for per-connection state
-                (gamepad associations, clipboard debounce).
+                (gamepad associations, clipboard transfers and debounce).
         """
         try:
             from .desktop_control import control
@@ -7659,15 +7705,9 @@ class WebRTCInput:
                     if declared_size < 0 or declared_size > MULTIPART_CLIPBOARD_MAX_SIZE:
                         logger_webrtc_input.error(f"Rejecting multi-part clipboard write: declared size {declared_size} out of bounds (max {MULTIPART_CLIPBOARD_MAX_SIZE}).")
                         return
-                    if self.multipart_clipboard_in_progress and transfer_id != self.multipart_clipboard_id:
-                        logger_webrtc_input.warning(f"Aborting previous in-progress clipboard transfer {self.multipart_clipboard_id} for new transfer {transfer_id}.")
-                    self.multipart_clipboard_id = transfer_id
-                    self.multipart_clipboard_kind = "text"
-                    self.multipart_clipboard_total_size = declared_size
-                    self.multipart_clipboard_mime_type = "text/plain"
-                    self.multipart_clipboard_buffer = io.BytesIO()
-                    self.multipart_clipboard_in_progress = True
-                    logger_webrtc_input.info(f"Starting multi-part text clipboard receive, total size: {self.multipart_clipboard_total_size}")
+                    self._start_clipboard_transfer(conn_id, ClipboardTransfer(
+                        transfer_id, "text", "text/plain", declared_size))
+                    logger_webrtc_input.info(f"Starting multi-part text clipboard receive, total size: {declared_size}")
                 except Exception as e:
                     logger_webrtc_input.error(f"Invalid cws message: {msg}, error: {e}")
             else:
@@ -7681,15 +7721,9 @@ class WebRTCInput:
                     if declared_size < 0 or declared_size > MULTIPART_CLIPBOARD_MAX_SIZE:
                         logger_webrtc_input.error(f"Rejecting multi-part clipboard write: declared size {declared_size} out of bounds (max {MULTIPART_CLIPBOARD_MAX_SIZE}).")
                         return
-                    if self.multipart_clipboard_in_progress and transfer_id != self.multipart_clipboard_id:
-                        logger_webrtc_input.warning(f"Aborting previous in-progress clipboard transfer {self.multipart_clipboard_id} for new transfer {transfer_id}.")
-                    self.multipart_clipboard_id = transfer_id
-                    self.multipart_clipboard_kind = "binary"
-                    self.multipart_clipboard_mime_type = toks[2]
-                    self.multipart_clipboard_total_size = declared_size
-                    self.multipart_clipboard_buffer = io.BytesIO()
-                    self.multipart_clipboard_in_progress = True
-                    logger_webrtc_input.info(f"Starting multi-part binary clipboard receive ({self.multipart_clipboard_mime_type}), total size: {self.multipart_clipboard_total_size}")
+                    self._start_clipboard_transfer(conn_id, ClipboardTransfer(
+                        transfer_id, "binary", toks[2], declared_size))
+                    logger_webrtc_input.info(f"Starting multi-part binary clipboard receive ({toks[2]}), total size: {declared_size}")
                 except Exception as e:
                     logger_webrtc_input.error(f"Invalid cbs message: {msg}, error: {e}")
             else:
@@ -7700,45 +7734,51 @@ class WebRTCInput:
             # leave the multipart state half-open, accumulating until overflow.
             if len(toks) < 3:
                 logger_webrtc_input.warning(f"Malformed clipboard chunk ({msg_type}): missing fields; aborting transfer.")
-                self._reset_multipart_clipboard()
-            elif not (self.multipart_clipboard_in_progress and toks[1] == self.multipart_clipboard_id and self.multipart_clipboard_kind == expected_kind):
+                self._clipboard_transfers.pop(conn_id, None)
+                return
+            transfer = self._active_clipboard_transfer(conn_id, toks[1], expected_kind)
+            if transfer is None:
                 logger_webrtc_input.warning(f"Ignoring mismatched clipboard chunk ({msg_type}): id/kind does not match active transfer.")
             else:
                 try:
                     chunk_data = base64.b64decode(toks[2])
-                    if self.multipart_clipboard_buffer.tell() + len(chunk_data) > self.multipart_clipboard_total_size:
+                    if transfer.buffer.tell() + len(chunk_data) > transfer.declared_size:
                         logger_webrtc_input.error("Multi-part clipboard exceeded its declared size; aborting transfer.")
-                        self._reset_multipart_clipboard()
+                        self._clipboard_transfers.pop(conn_id, None)
                         return
-                    self.multipart_clipboard_buffer.write(chunk_data)
+                    transfer.buffer.write(chunk_data)
                 except Exception as e:
                     logger_webrtc_input.error(f"Failed to process clipboard data chunk: {e}")
-                    self._reset_multipart_clipboard()
+                    self._clipboard_transfers.pop(conn_id, None)
         elif msg_type == "cwe" or msg_type == "cbe":
             expected_kind = "text" if msg_type == "cwe" else "binary"
             # Token count first, so a malformed end does not raise mid-state.
             if len(toks) < 2:
                 logger_webrtc_input.warning(f"Malformed clipboard end ({msg_type}): missing id; aborting transfer.")
-                self._reset_multipart_clipboard()
-            elif not (self.multipart_clipboard_in_progress and toks[1] == self.multipart_clipboard_id and self.multipart_clipboard_kind == expected_kind):
+                self._clipboard_transfers.pop(conn_id, None)
+                return
+            transfer = self._active_clipboard_transfer(conn_id, toks[1], expected_kind)
+            if transfer is None:
                 logger_webrtc_input.warning(f"Ignoring mismatched clipboard end ({msg_type}): id/kind does not match active transfer.")
+                return
+            # Closed before the write awaits, so a transfer the same connection
+            # starts meanwhile is its own.
+            del self._clipboard_transfers[conn_id]
+            received_size = transfer.buffer.tell()
+            if received_size != transfer.declared_size:
+                logger_webrtc_input.error(f"Multi-part clipboard size mismatch. Expected {transfer.declared_size}, got {received_size}. Aborting.")
             else:
-                received_size = self.multipart_clipboard_buffer.tell()
-                if received_size != self.multipart_clipboard_total_size:
-                    logger_webrtc_input.error(f"Multi-part clipboard size mismatch. Expected {self.multipart_clipboard_total_size}, got {received_size}. Aborting.")
-                else:
-                    logger_webrtc_input.info(f"Finished multi-part clipboard receive. Total size: {received_size}")
-                    data = self.multipart_clipboard_buffer.getvalue()
-                    mime_type = self.multipart_clipboard_mime_type
-                    # Awaited in-line: a paste keystroke right behind the transfer
-                    # must find the clipboard set. Bytes pass straight through; a
-                    # multi-MB decode and re-encode on the loop would be redundant.
-                    if await self.write_clipboard(data, mime_type=mime_type):
-                        if mime_type == "text/plain":
-                            logger_webrtc_input.info(f"Set multi-part clipboard content, length: {len(data)}")
-                        else:
-                            logger_webrtc_input.info(f"Set multi-part binary clipboard content ({mime_type}), size: {len(data)} bytes")
-                self._reset_multipart_clipboard()
+                logger_webrtc_input.info(f"Finished multi-part clipboard receive. Total size: {received_size}")
+                data = transfer.buffer.getvalue()
+                mime_type = transfer.mime_type
+                # Awaited in-line: a paste keystroke right behind the transfer
+                # must find the clipboard set. Bytes pass straight through; a
+                # multi-MB decode and re-encode on the loop would be redundant.
+                if await self.write_clipboard(data, mime_type=mime_type):
+                    if mime_type == "text/plain":
+                        logger_webrtc_input.info(f"Set multi-part clipboard content, length: {len(data)}")
+                    else:
+                        logger_webrtc_input.info(f"Set multi-part binary clipboard content ({mime_type}), size: {len(data)} bytes")
         elif msg_type == "cr":
             if self.enable_clipboard in ["true", "out"]:
                 data, mime_type = await self.read_clipboard(use_binary=self.enable_binary_clipboard in ["true", "out"])

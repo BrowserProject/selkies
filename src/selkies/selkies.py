@@ -4299,7 +4299,7 @@ class DataStreamingServer(BaseStreamingService):
                         if self.input_handler and hasattr(
                             self.input_handler, "on_message"
                         ):
-                            # conn_id keeps the clipboard debounce per connection, not per display.
+                            # conn_id keeps clipboard transfers and debounce per connection, not per display.
                             await self.input_handler.on_message(message, client_display_id, conn_id=id(websocket))
 
         except (ConnectionResetError, OSError, RuntimeError) as e:
@@ -4318,6 +4318,8 @@ class DataStreamingServer(BaseStreamingService):
             # the remaining clients only.
             self.clients.discard(websocket)
             data_logger.info(f"Cleaning up Data WS handler for {raddr} (Display ID: {client_display_id})...")
+            if self.input_handler is not None:
+                self.input_handler.release_clipboard_for_conn(id(websocket))
             # A tab that dies mid-press never sends 'js,d'; the button would stay
             # stuck on the virtual pad.
             if self.input_handler and hasattr(self.input_handler, "release_gamepads_for_conn"):

@@ -1560,15 +1560,17 @@ class WebRTCService(BaseStreamingService):
         self, peer_id: str, peer: Optional[Dict[str, Any]] = None
     ) -> None:
         """Release the input a departing peer may still be holding, matching the
-        websockets disconnect cleanup. Gamepad slots are per-connection, so they
-        are always released. Held keys and pointer buttons are one global desktop
-        state instead: they are force-released only when the departing peer could
-        drive input and no input-capable peer is left, so a viewer (or a second
-        display's peer) leaving never drops the controller's held keys or its
-        in-flight drag. A controller that vanishes while others remain is covered
-        by the input handler's heartbeat stale-sweep."""
+        websockets disconnect cleanup. Gamepad slots and the clipboard transfer
+        are per-connection, so they are always released. Held keys and pointer
+        buttons are one global desktop state instead: they are force-released
+        only when the departing peer could drive input and no input-capable peer
+        is left, so a viewer (or a second display's peer) leaving never drops
+        the controller's held keys or its in-flight drag. A controller that
+        vanishes while others remain is covered by the input handler's
+        heartbeat stale-sweep."""
         if self.input_handler is None:
             return
+        self.input_handler.release_clipboard_for_conn(peer_id)
         try:
             await self.input_handler.release_gamepads_for_conn(peer_id)
         except Exception as e:

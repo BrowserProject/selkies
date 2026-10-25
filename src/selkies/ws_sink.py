@@ -355,7 +355,8 @@ class WsClient:
 
     Attributes:
         conn_id: Transport connection identity, handed to the input handler so
-            per-connection state (clipboard debounce) traces back here.
+            per-connection state (clipboard transfer and debounce) traces back
+            here.
         role: "controller" or "viewer", transport-independent.
         token: Session token in secure mode, else None.
         slot: Legacy-mode player slot claim (2..4), else None.
@@ -1776,10 +1777,12 @@ class WsSink:
             client.relay.stop()
             client.relay = None
         self._sync_media_hooks()
+        handler = getattr(self.service, "input_handler", None)
+        if handler is not None:
+            handler.release_clipboard_for_conn(client.conn_id)
         held_authority = _perms_hold_input_authority(
             {"role": client.role, "token": client.token}, token=client.token)
         if held_authority and not self._input_capable_left():
-            handler = getattr(self.service, "input_handler", None)
             if handler is not None:
                 for release in (handler.release_mouse_buttons, handler.reset_keyboard):
                     try:
