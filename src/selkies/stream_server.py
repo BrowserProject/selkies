@@ -54,6 +54,8 @@ except ImportError:
 
 from abc import ABCMeta, abstractmethod
 
+from . import session_files
+
 
 logger = logging.getLogger("stream_server")
 
@@ -1144,6 +1146,7 @@ class CentralizedStreamServer:
             os.path.expanduser(self.settings.file_manager_path)
         ).resolve()
         self._chunked_uploads: Dict[str, Dict[str, Any]] = {}
+        self.session_files = session_files.SessionFiles(self)
         self.web_files_ctx: Optional[tempfile.TemporaryDirectory] = None
         # Set when this build simply ships no packaged viewer, which is a
         # deployment choice and not an error (see _get_static_content_path).
@@ -1743,7 +1746,9 @@ class CentralizedStreamServer:
         """Authorize one request and hand it to `handler`, or refuse it.
 
         Layered gates, in order: cross-site WebSocket upgrades are rejected by
-        Origin; health/liveness endpoints pass without credentials; the token
+        Origin; health/liveness endpoints pass without credentials; the file
+        plane (`/api/upload`, `/api/files`) answers to a session transfer token
+        only (`session_files.authorize`), whatever else is configured; the token
         and mode-switch control endpoints accept the Bearer master token,
         trying `Authorization` first and the `MASTER_TOKEN_HEADER` fallback
         second for callers whose Authorization header a Basic login in front
@@ -1782,6 +1787,10 @@ class CentralizedStreamServer:
                 return web.Response(status=403, text="Forbidden origin")
         if path in (f"{api_prefix}/api/status", f"{api_prefix}/api/health"):
             return await handler(request)
+        transfer = session_files.transfer_route(path, api_prefix)
+        if transfer is not None:
+            refusal = session_files.authorize(request, transfer)
+            return refusal if refusal is not None else await handler(request)
         if path == f"{api_prefix}/api/desktop":
             control_token = os.environ.get("SELKIES_SWITCH_TOKEN", "")
             if control_token and hmac.compare_digest(
@@ -2714,8 +2723,9 @@ class CentralizedStreamServer:
             web.get(f"{api_prefix}/api/health", self.handle_health),
             web.post(f"{api_prefix}/api/switch", self.handle_switch),
             web.post(f"{api_prefix}/api/desktop", self.handle_desktop),
-            web.post(f"{api_prefix}/api/upload", self.handle_upload),
-            web.get(f"{api_prefix}/api/files/{{path:.*}}", self.fancy_index_handler),
+            web.post(f"{api_prefix}/api/upload", self.session_files.handle_upload),
+            web.get(f"{api_prefix}/api/files", self.session_files.handle_files),
+            web.get(f"{api_prefix}/api/files/{{path:.*}}", self.session_files.handle_files),
         ]
         if self.settings.enable_metrics_http[0]:
             routes.append(web.get(f"{api_prefix}/api/metrics", self.handle_metrics))
