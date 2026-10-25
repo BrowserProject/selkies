@@ -425,7 +425,8 @@ class WebRTCPeerManagement:
             while True:
                 msg_obj = await self.recv_msg_ping(ws, raddr)
 
-                if msg_obj.type in [WSMsgType.CLOSE, WSMsgType.CLOSING]:
+                # CLOSED is the socket lost without a close frame (1006).
+                if msg_obj.type in [WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED]:
                     logger.info(f"Peer connection closed: {uid!r}")
                     break
                 elif msg_obj.type == WSMsgType.ERROR:

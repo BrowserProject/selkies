@@ -75,6 +75,12 @@ from .audio_control import AudioControl
 
 logger = logging.getLogger("webrtc")
 
+# Idle signaling sockets are pinged this often. After the offer/answer the
+# socket carries nothing, and school and corporate web filters drop a
+# WebSocket idle for about 15 s; both ends take a lost signaling socket for a
+# dead peer and would tear down and rebuild a healthy WebRTC stream.
+SIGNALING_KEEPALIVE_S = 10
+
 
 def _selkies_is_aioice_frame_chain(exc: BaseException) -> bool:
     """Return True when the exception's traceback passes through the vendored
@@ -542,7 +548,7 @@ class WebRTCService(BaseStreamingService):
         """Build the signaling-side peer manager with the fetched RTC config
         and the TURN/STUN/sharing options the handshake needs."""
         options = argparse.Namespace(
-            keepalive_timeout=30,
+            keepalive_timeout=SIGNALING_KEEPALIVE_S,
             rtc_config_file=self.args.rtc_config_json,
             turn_shared_secret=self.args.turn_shared_secret,
             rtc_config=rtc_config,
