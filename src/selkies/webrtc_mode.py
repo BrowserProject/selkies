@@ -2602,7 +2602,7 @@ class WebRTCService(BaseStreamingService):
         # No getattr default: a misnamed setting must raise, not disable the pacer.
         pacer_on = bool(settings.webrtc_pacer[0])
         logger.info(f"WebRTC pacer setting: {'ON' if pacer_on else 'OFF'}.")
-        from .stream_control import CONFIG, StreamController, frame_rate
+        from .stream_control import CONFIG, StreamController
         controllers = {}
         while True:
             await asyncio.sleep(1.0)
@@ -2673,7 +2673,7 @@ class WebRTCService(BaseStreamingService):
                     fps_ceiling = int(self._display_setting(did, "framerate"))
                     if controller.pixel_cap < requested[0] * requested[1]:
                         fps_ceiling = min(fps_ceiling, int(CONFIG["reduced_fps"]))
-                    fps = frame_rate(target, pipeline.width * pipeline.height, fps_ceiling, pipeline.framerate)
+                    fps = controller.frame_rate(target, pipeline.width * pipeline.height, fps_ceiling, pipeline.framerate)
                     if target != round(current):
                         logger.info(
                             f"Congestion control[{did}]: video bitrate {current:.0f} -> {target:.0f} kbps "
