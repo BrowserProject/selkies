@@ -32,8 +32,8 @@ Structural notes:
 - Everything runs on one asyncio loop. Capture threads never touch the loop
   directly; encoded frames arrive via `loop.call_soon_threadsafe` into
   `PipelineBridge` queues that the media tracks drain.
-- Data-channel dispatch is serialized per channel through a bounded queue with
-  a single consumer task so input events keep strict arrival order.
+- Data-channel dispatch is serialized per channel through an `InputQueue`
+  with a single consumer task so input events keep strict arrival order.
 - Behavior deliberately mirrors the websockets transport (broadcast semantics,
   viewer/collaborator input gates, MK_ACCESS/AUTH_SUCCESS verdicts); parity
   between the two transports is a project invariant. The input gates share
@@ -97,6 +97,7 @@ from .input_handler import (
     VIEWER_COLLAB_EXTRA_PREFIXES,
     VIEWER_SILENT_DROP_PREFIXES,
 )
+from .input_queue import InputQueue, Overflow, RELEASE_MESSAGES
 from .selkies import current_session_tokens
 from .ws_sink import (dispatch_client_message, gamepad_denied,
                       secure_input_denied, viewer_is_collaborator)
@@ -1454,7 +1455,7 @@ class RTCApp:
         logger.debug(f"Forcing codec preferences to: {preferences}")
         transceiver.setCodecPreferences(preferences)
 
-    async def _drain_channel_queue(self, queue: asyncio.Queue,
+    async def _drain_channel_queue(self, queue: InputQueue,
                                    handler: Callable[[Any], Any],
                                    label: str) -> None:
         """Single consumer that dispatches queued messages strictly in order.
@@ -1462,45 +1463,45 @@ class RTCApp:
         Running one awaited handler at a time is what guarantees ordering: if
         each message spawned its own task, handlers that await mid-dispatch
         could complete out of order (e.g. a key-up finishing before its
-        key-down, sticking the key).
+        key-down, sticking the key). Where the queue shed messages, every held
+        key and button is released in their place.
         """
         while True:
-            msg = await queue.get()
-            try:
-                result = handler(msg)
-                if inspect.isawaitable(result):
-                    await result
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error("Error handling message on channel %s: %s", label, e)
+            item = await queue.get()
+            messages = (item,)
+            if isinstance(item, Overflow):
+                logger.warning(
+                    "Data channel %s input backlog over its cap: dropped %d messages, "
+                    "releasing held keys and buttons", label, item.dropped)
+                messages = RELEASE_MESSAGES
+            for msg in messages:
+                try:
+                    result = handler(msg)
+                    if inspect.isawaitable(result):
+                        await result
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error("Error handling message on channel %s: %s", label, e)
 
     def _serialize_channel(self, channel: RTCDataChannel,
-                           handler: Callable[[Any], Any],
-                           max_queue: int = 512) -> "asyncio.Task":
-        """Wire a channel's messages through a bounded per-channel queue drained
-        by a single consumer task, so dispatch stays in arrival order.
+                           handler: Callable[[Any], Any]) -> "asyncio.Task":
+        """Wire a channel's messages through its `InputQueue`, drained by a
+        single consumer task, so dispatch stays in arrival order.
 
-        The message handler only enqueues (drop+log on overflow); the consumer
-        is cancelled when the channel closes. handler is called late-bound so
-        reassigning the target callback still takes effect.
+        The message handler only enqueues; the consumer is cancelled when the
+        channel closes. handler is called late-bound so reassigning the target
+        callback still takes effect.
 
         Returns:
             The consumer task, so teardown paths can cancel it for channels
             that never emit a close event.
         """
-        queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue)
-
-        def _enqueue(msg: Any) -> None:
-            try:
-                queue.put_nowait(msg)
-            except asyncio.QueueFull:
-                logger.warning("Data channel %s input queue full, dropping message", channel.label)
-
+        queue = InputQueue()
         consumer = self.async_event_loop.create_task(
             self._drain_channel_queue(queue, handler, channel.label)
         )
-        channel.on("message", _enqueue)
+        channel.on("message", queue.put)
         channel.on("close", lambda: consumer.cancel())
         return consumer
 
