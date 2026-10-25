@@ -1990,6 +1990,10 @@ class CentralizedStreamServer:
         everyone (the switch restarts the service under every connected page).
         Refused as well when dual mode is disabled.
         """
+        switch_token = os.environ.get("SELKIES_SWITCH_TOKEN", "")
+        presented = request.headers.get("X-Selkies-Switch-Token", "")
+        if not switch_token or not hmac.compare_digest(presented.encode(), switch_token.encode()):
+            return web.json_response({"status": "error", "message": "Forbidden switch"}, status=403)
         if self._viewer_ceiling(request):
             return web.json_response(
                 {"status": "error", "message": "View-only credentials cannot switch streaming mode"},
