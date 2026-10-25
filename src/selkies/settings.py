@@ -1224,6 +1224,8 @@ class AppSettings:
                 )
         self._process_and_set_attributes(args)
         self._post_process_settings()
+        from .stream_profiles import policy
+        policy.configure(self)
 
     @staticmethod
     def _fallback_env_vars(setting: Dict[str, Any]) -> Tuple[str, ...]:
@@ -1528,6 +1530,10 @@ class AppSettings:
         control. Called again on a live transport switch so an unpinned mode
         tracks the transport actually streaming.
         """
+        from .stream_profiles import policy
+        if policy.enabled:
+            policy.configure(self)
+            return
         if not self.enable_rate_control[0] or self.was_provided("rate_control_mode"):
             return
         if self.mode == "webrtc":
@@ -1848,6 +1854,9 @@ def build_client_settings_payload() -> Dict[str, Dict[str, Any]]:
     out['clipboard_in_enabled'] = {'value': clip in ('true', 'in')}
     out['clipboard_out_enabled'] = {'value': clip in ('true', 'out')}
     out['software_h264_encoder'] = {'value': software_h264_encoder()}
+    from .stream_profiles import policy
+    if policy.enabled:
+        out['stream_profile'] = policy.metadata()
     return out
 
 

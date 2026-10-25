@@ -833,6 +833,7 @@ class WebRTCService(BaseStreamingService):
         # Store the plain value: str(<str-Enum>) formats as the member name on
         # some supported Python versions, which would corrupt later comparisons.
         mode_str = mode.value if isinstance(mode, RateControlMode) else str(mode)
+        mode_str = sanitize_client_setting("rate_control_mode", mode_str, self.settings, logger)
         await self._apply_display_setting(display_id or "primary", "rate_control_mode", mode_str)
 
     async def handle_crf_change(self, crf: int, display_id: str = "primary") -> None:
@@ -1785,6 +1786,8 @@ class WebRTCService(BaseStreamingService):
         retries instead of finding a dead pipeline.
         """
         async with self._display_lock:
+            from .stream_profiles import policy
+            policy.displays({"primary": None, **self.display_clients})
             secondary = next(
                 ((did, info) for did, info in self.display_clients.items()
                  if did != "primary" and info.get("width", 0) > 0 and info.get("height", 0) > 0),
@@ -1849,6 +1852,9 @@ class WebRTCService(BaseStreamingService):
             self._primary_dims = clamp_primary_feedback(
                 self._primary_dims, self.display_layouts, position
             )
+            if policy.enabled and self._server_locked_dims() is None:
+                self._primary_dims = policy.fit(*self._primary_dims)
+                info["width"], info["height"] = policy.fit(info["width"], info["height"])
             layouts, total_w, total_h = compute_dual_layout(
                 self._primary_dims, (info["width"], info["height"]), position,
             )
@@ -2289,7 +2295,11 @@ class WebRTCService(BaseStreamingService):
     def _use_cpu_for_display(self, display_id: str) -> bool:
         return bool(self._display_setting(display_id, "use_cpu"))
 
-    async def handle_update_settings(
+    async def handle_update_settings(self, settings_json, display_id="primary"):
+        from .stream_profiles import apply_rtc
+        await apply_rtc(self, settings_json, display_id or "primary")
+
+    async def _apply_profile_settings(
         self, settings_json: Dict[str, Any], display_id: str = "primary"
     ) -> None:
         """Apply a client SETTINGS payload to the display that sent it.

@@ -592,7 +592,8 @@ def parse_resize_dims(res_str: str) -> Optional[Tuple[int, int]]:
     w, h = min(w, 7680) & ~1, min(h, 4320) & ~1
     if w <= 0 or h <= 0:
         return None
-    return w, h
+    from .stream_profiles import policy
+    return policy.fit(w, h)
 
 
 def cursor_size_for_dpi(dpi: float, base_size: int) -> int:

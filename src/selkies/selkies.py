@@ -2733,6 +2733,8 @@ class DataStreamingServer(BaseStreamingService):
         def get_str(k):
             v = settings_data.get(k)
             return str(v) if v is not None else None
+        parsed["stream_profile"] = settings_data.get("stream_profile")
+        parsed["stream_profile_request"] = settings_data.get("stream_profile_request")
         parsed["framerate"] = get_int("framerate")
         parsed["video_crf"] = get_int("video_crf")
         parsed["encoder"] = get_str("encoder")
@@ -2775,7 +2777,11 @@ class DataStreamingServer(BaseStreamingService):
         data_logger.debug(f"Parsed client settings: {parsed}")
         return parsed
 
-    async def _apply_client_settings(
+    async def _apply_client_settings(self, websocket_obj, settings, is_initial_settings, client_role="controller"):
+        from .stream_profiles import apply_ws
+        await apply_ws(self, websocket_obj, settings, is_initial_settings, client_role)
+
+    async def _apply_profile_settings(
         self,
         websocket_obj: web.WebSocketResponse,
         settings: dict,
@@ -2893,6 +2899,9 @@ class DataStreamingServer(BaseStreamingService):
                             f"Aligning resolution for '{display_id}' from {target_w}x{target_h} to {aligned_w}x{aligned_h} (16-pixel alignment)."
                         )
                     target_w, target_h = aligned_w, aligned_h
+                if not server_is_manual:
+                    from .stream_profiles import policy
+                    target_w, target_h = policy.fit(target_w, target_h)
                 resolution_actually_changed = (target_w != old_display_width or target_h != old_display_height)
                 position_actually_changed = (new_position != old_position)
                 if resolution_actually_changed or position_actually_changed:
@@ -4955,6 +4964,12 @@ class DataStreamingServer(BaseStreamingService):
         video_active kept so the next successful pass restarts it — which
         also surfaces a dead host compositor.
         """
+        from .stream_profiles import policy
+        policy.displays(self.display_clients)
+        if policy.enabled and not self.cli_args.manual_resolution[0]:
+            for client in self.display_clients.values():
+                if client.get("width", 0) > 0 and client.get("height", 0) > 0:
+                    client["width"], client["height"] = policy.fit(client["width"], client["height"])
         current_display_count = len(self.display_clients)
         await self._wm_swap.ensure_for(current_display_count, IS_WAYLAND)
         if not self.display_clients:
