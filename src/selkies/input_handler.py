@@ -3768,6 +3768,10 @@ class WebRTCInput:
         self.key_repeat_heartbeat_grace = 0.3
         self.key_repeat_state = {}
         self.key_repeat_task = None
+        # Wakes the repeat and stale-sweep loops only while something is held,
+        # so an idle session does not tick them 60 times a second.
+        self._key_repeat_wake = asyncio.Event()
+        self._key_sweep_wake = asyncio.Event()
         self.keymap_watch_task = None
         self.on_update_rate_control_mode = lambda mode, display_id="primary": logger_webrtc_input.warning("unhandled on_update_rate_control_mode")
         self.on_update_crf = lambda value, display_id="primary": logger_webrtc_input.warning("unhandled on_update_crf")
@@ -4270,6 +4274,9 @@ class WebRTCInput:
         """
         try:
             while True:
+                if not self.pressed_keys and not self.gamepad_heartbeats:
+                    self._key_sweep_wake.clear()
+                    await self._key_sweep_wake.wait()
                 await asyncio.sleep(self.key_sweep_interval)
                 if not self.pressed_keys and not self.gamepad_heartbeats:
                     continue
@@ -4348,6 +4355,9 @@ class WebRTCInput:
         """
         try:
             while True:
+                if not self.key_repeat_state:
+                    self._key_repeat_wake.clear()
+                    await self._key_repeat_wake.wait()
                 await asyncio.sleep(self.key_repeat_tick)
                 if not self.key_repeat_state:
                     continue
@@ -7481,6 +7491,7 @@ class WebRTCInput:
                     oldest_keysym = min(self.pressed_keys, key=self.pressed_keys.get)
                     self.pressed_keys.pop(oldest_keysym, None)
                 self.pressed_keys[keysym] = time.monotonic()
+            self._key_sweep_wake.set()
             self.reaped_atomic_keys.discard(keysym)
             if self.is_wayland:
                 self._keyboard_enqueue(("kd", keysym))
@@ -7506,6 +7517,7 @@ class WebRTCInput:
                 if (self.key_repeat_enabled and keysym not in self.MODIFIER_KEYSYMS):
                     self.key_repeat_state.pop(keysym, None)
                     self.key_repeat_state[keysym] = time.monotonic() + self.key_repeat_delay
+                    self._key_repeat_wake.set()
                 else:
                     self.key_repeat_state.pop(keysym, None)
         elif msg_type == "ku":
@@ -7627,6 +7639,7 @@ class WebRTCInput:
             elif cmd == "h":
                 # Held-state heartbeat: refresh only (no injection), like 'kh'.
                 self.gamepad_heartbeats[gamepad_idx] = time.monotonic()
+                self._key_sweep_wake.set()
 
             else: logger_webrtc_input.warning(f"Unhandled joystick command for slot {gamepad_idx}: js {cmd}")
         elif msg_type == "cws":
