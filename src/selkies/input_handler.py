@@ -161,6 +161,8 @@ VIEWER_ALLOWED_PREFIXES = (
     "STOP_VIDEO",
     "REQUEST_KEYFRAME",
     "js,",
+    # Asks for the agent/human control state (desktop_control.py); changes nothing.
+    "ctl,status",
 )
 VIEWER_COLLAB_EXTRA_PREFIXES = (
     "kd", "ku", "kh", "kr", "m", "m2",
@@ -7446,6 +7448,9 @@ class WebRTCInput:
                 (gamepad associations, clipboard debounce).
         """
         try:
+            from .desktop_control import control
+            if not await control.human(self, msg):
+                return
             await self._dispatch_message(msg, display_id, conn_id)
         except (IndexError, ValueError) as e:
             logger_webrtc_input.warning(f"Malformed client message {msg[:64]!r}: {e}")

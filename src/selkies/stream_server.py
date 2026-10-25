@@ -1782,6 +1782,12 @@ class CentralizedStreamServer:
                 return web.Response(status=403, text="Forbidden origin")
         if path in (f"{api_prefix}/api/status", f"{api_prefix}/api/health"):
             return await handler(request)
+        if path == f"{api_prefix}/api/desktop":
+            control_token = os.environ.get("SELKIES_SWITCH_TOKEN", "")
+            if control_token and hmac.compare_digest(
+                request.headers.get("X-Selkies-Switch-Token", "").encode(), control_token.encode()
+            ):
+                return await handler(request)
         token_path = path == f"{api_prefix}/api/tokens"
         if settings.master_token and token_path:
             if not any(
@@ -2047,6 +2053,10 @@ class CentralizedStreamServer:
         stay available: a viewer is already watching the session.
         """
         return request.get("auth_role_ceiling") == "viewer"
+
+    async def handle_desktop(self, request):
+        from .desktop_control import handle_desktop
+        return await handle_desktop(self, request)
 
     async def handle_switch(self, request: web.Request) -> web.Response:
         """POST /api/switch: change the active streaming mode.
@@ -2703,6 +2713,7 @@ class CentralizedStreamServer:
             web.get(f"{api_prefix}/api/status", self.handle_status),
             web.get(f"{api_prefix}/api/health", self.handle_health),
             web.post(f"{api_prefix}/api/switch", self.handle_switch),
+            web.post(f"{api_prefix}/api/desktop", self.handle_desktop),
             web.post(f"{api_prefix}/api/upload", self.handle_upload),
             web.get(f"{api_prefix}/api/files/{{path:.*}}", self.fancy_index_handler),
         ]
