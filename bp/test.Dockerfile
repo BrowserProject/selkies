@@ -26,6 +26,7 @@ RUN apt-get update && \
     libxfixes3 \
     libxkbcommon0 \
     libxtst6 \
+    pulseaudio \
     python3 \
     python3-venv \
     x11-xserver-utils \

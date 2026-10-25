@@ -12,6 +12,7 @@ subject starting with `bp`. Default branch `bp/main`; `main` mirrors upstream.
 | `bp: normalize the punctuation ...`, `bp 0001` to `bp 0035` | The patches the BrowserProject images applied to the vendored tarball, in their order and with their documentation as commit messages (no `0025`; none was made unnecessary by upstream's `SELKIES_UNIX_SOCKET`, no patch touched listening) |
 | `src/selkies/connection_scopes.py` | Per-connection scopes from the relay (`SELKIES_CONNECTION_SCOPES`, header `X-BP-Scopes`), held on every channel |
 | `tests/bp/` | The patch tests (`tests.list`), run by `bp/run-tests.sh` in `bp/test.Dockerfile` |
+| `bp/stream-check/` | The headless stream check: the viewer cores in Chrome against a Selkies in the test environment, over the WebSocket sink and WebRTC, with a view-only and a full grant (frames decode, input, clipboard and files of the view-only grant refused, the encoder rate line of `bp 0035`), and Selkies on `SELKIES_UNIX_SOCKET` |
 | `addons/selkies-web-core/` | BrowserProject's viewer cores, in upstream's place so a rebase merges upstream's client changes into them |
 | `bp/client/` | The `@browserproject/selkies-client` package of those cores, with `.d.ts` types |
 | `.github/workflows/bp-*.yml` | This fork's CI and releases; upstream's automatic workflows (`ci.yaml`, `docs.yaml`, `devcontainer-feature.yaml`) are removed, its manual ones are unused |
@@ -20,7 +21,7 @@ The product modules (`stream_profiles.py`, `stream_control.py` and the others)
 are not here: they are the package `containers/browser-base/selkies-ext` of
 BrowserProject/browser, installed into this fork's `selkies` package beside
 the wheel. The fork imports them as `selkies.<module>`, so most tests here run
-only with them installed. CI runs the suites when the secret
+only with them installed. CI runs the suites and the stream check when the secret
 `BP_SELKIES_EXT_TOKEN` (read-only contents of BrowserProject/browser) is set
 and otherwise says so in a warning; BrowserProject/browser runs them against
 every pinned release.

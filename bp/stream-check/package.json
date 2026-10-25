@@ -1,0 +1,10 @@
+{
+  "name": "bp-selkies-stream-check",
+  "private": true,
+  "type": "module",
+  "description": "Tooling of bp/stream-check/check.mjs",
+  "devDependencies": {
+    "playwright-core": "1.63.0",
+    "ws": "8.22.0"
+  }
+}

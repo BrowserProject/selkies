@@ -1,6 +1,6 @@
 # The fork's CI: the wheel, its install on Debian trixie, the patch and
-# product test suites, and the client package. bp-release.yml runs it for a
-# release tag.
+# product test suites with the headless stream check, and the client package.
+# bp-release.yml runs it for a release tag.
 name: bp CI
 
 on:
@@ -79,7 +79,7 @@ jobs:
             cd /tmp && /tmp/venv/bin/python -c "import selkies, selkies.connection_scopes; print(\"import selkies ok\")"'
 
   tests:
-    name: Patch and product test suites
+    name: Patch and product test suites, stream check
     needs: wheel
     runs-on: ubuntu-latest
     steps:
@@ -90,7 +90,7 @@ jobs:
           TOKEN: ${{ secrets.BP_SELKIES_EXT_TOKEN }}
         run: |
           if [ -z "$TOKEN" ]; then
-            echo "::warning title=Patch tests skipped::BP_SELKIES_EXT_TOKEN is not set, so the product modules of BrowserProject/browser (containers/browser-base/selkies-ext) cannot be read and the suites, which import them, do not run here. BrowserProject/browser runs them against every pinned release (job selkies-ext)."
+            echo "::warning title=Patch tests skipped::BP_SELKIES_EXT_TOKEN is not set, so the product modules of BrowserProject/browser (containers/browser-base/selkies-ext) cannot be read and the suites and the stream check, which import them, do not run here. BrowserProject/browser runs them against every pinned release (job selkies-ext)."
             echo "present=false" >> "$GITHUB_OUTPUT"
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
@@ -115,6 +115,15 @@ jobs:
           docker run --rm -v "$PWD:/fork" -w /fork bp-selkies-test \
             bp/run-tests.sh --ext browser/containers/browser-base/selkies-ext \
               dist/*.whl tests/bp browser/containers/browser-base/selkies-ext/tests
+      - if: steps.ext.outputs.present == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - if: steps.ext.outputs.present == 'true'
+        name: Headless stream check
+        run: |
+          npm ci --prefix bp/stream-check --no-audit --no-fund
+          bp/stream-check/run.sh bp-selkies-test dist/*.whl browser/containers/browser-base/selkies-ext
 
   client:
     name: Client package
