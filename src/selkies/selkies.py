@@ -2746,6 +2746,7 @@ class DataStreamingServer(BaseStreamingService):
         parsed["manual_width"] = get_int(
             "manual_width"
         )
+        parsed["release_screen"] = get_bool("release_screen")
         parsed["manual_height"] = get_int(
             "manual_height"
         )
@@ -6183,6 +6184,7 @@ async def on_resize_handler(
     current_app_instance: SelkiesStreamingApp,
     data_server_instance: Optional[DataStreamingServer] = None,
     display_id: str = 'primary',
+    server: bool = False,
 ) -> None:
     """Handle a client resize request for one display.
 
@@ -6207,13 +6209,13 @@ async def on_resize_handler(
         display_id: The display being resized.
     """
     logger_app_resize.info(f"on_resize_handler for display '{display_id}' with resolution: {res_str}")
-    if (display_id == 'primary'
+    if (not server and display_id == 'primary'
             and not getattr(current_app_instance, 'server_enable_resize', True)):
         logger_app_resize.warning(f"Primary resize to {res_str} ignored: dynamic resizing disabled.")
         return
     if data_server_instance:
         server_is_manual, _ = data_server_instance.cli_args.manual_resolution
-        if server_is_manual:
+        if server_is_manual and not server:
             logger_app_resize.warning(
                 f"Client attempted to resize to {res_str} but server is in manual resolution mode. Request ignored."
             )

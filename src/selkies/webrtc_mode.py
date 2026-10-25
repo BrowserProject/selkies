@@ -938,7 +938,7 @@ class WebRTCService(BaseStreamingService):
             height = 768
         return (width - (width % 2), height - (height % 2))
 
-    async def _resize_primary_display(self, res: str) -> None:
+    async def _resize_primary_display(self, res: str, server: bool = False) -> None:
         """Resize the single (primary-only) display to a client-requested
         resolution, keep the capture dimensions in sync with what was realized,
         and tell the client the realized size when it differs.
@@ -958,7 +958,7 @@ class WebRTCService(BaseStreamingService):
         to it, and a nested session's own screen is re-sized to the same
         geometry at the DPI in force.
         """
-        if self._server_locked_dims() is not None:
+        if not server and self._server_locked_dims() is not None:
             logger.warning(
                 f"Client attempted to resize to {res} but server is in manual resolution mode. Request ignored."
             )
