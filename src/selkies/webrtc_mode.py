@@ -2727,7 +2727,8 @@ class WebRTCService(BaseStreamingService):
                     ceiling = float(self._display_setting(did, "video_bitrate") or hi_kbps)
                     ceiling = max(lo_kbps, min(hi_kbps, ceiling))
                     controller = controllers.setdefault(pipeline, StreamController())
-                    target = controller.target(current, ceiling, lo_kbps, goodputs, worst_loss, bucket.get("worst_delay", 0))
+                    target = controller.target(current, ceiling, lo_kbps, goodputs, worst_loss, bucket.get("worst_delay", 0),
+                                               (pipeline.encoded_delta_bytes, pipeline.encoded_keyframes))
                     requested = getattr(self, "_stream_requested_dims", {}).get(did, (pipeline.width, pipeline.height))
                     fps_ceiling = int(self._display_setting(did, "framerate"))
                     if controller.pixel_cap < requested[0] * requested[1]:
@@ -2736,7 +2737,8 @@ class WebRTCService(BaseStreamingService):
                     if target != round(current):
                         logger.info(
                             f"Congestion control[{did}]: video bitrate {current:.0f} -> {target:.0f} kbps "
-                            f"(goodput {min(goodputs, default=0) / 1e3:.1f} kbps, loss {worst_loss:.1%})"
+                            f"(goodput {min(goodputs, default=0) / 1e3:.1f} kbps, loss {worst_loss:.1%}"
+                            + (f", encoder {controller.encoder_kbps[-1]:.1f} kbps)" if controller.encoder_kbps else ")")
                         )
                         await pipeline.set_video_bitrate(target)
                     if controller.congested and fps != pipeline.framerate:

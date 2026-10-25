@@ -177,6 +177,11 @@ class MediaPipelinePixel(MediaPipeline):
         on_hold_padding: Awaitable that takes a padding tick's boundary and
             pads every video sender of the held display that sent nothing
             since it.
+        encoded_delta_bytes: Delta-frame bytes the encoder produced since the
+            pipeline was created; with `encoded_keyframes` the congestion
+            controller's measure of what the encoder offers.
+        encoded_keyframes: Keyframes the encoder produced, counted apart:
+            one keyframe is not a rate.
         capture_module: pixelflux `ScreenCapture`; Any, the import is optional.
         pcmflux_module: pcmflux `AudioCapture`; likewise.
         _video_pts_anchor: Video pts clock origin; pipeline-scoped rather than
@@ -272,6 +277,8 @@ class MediaPipelinePixel(MediaPipeline):
         self.async_lock = asyncio.Lock()
         self._video_pts_anchor: Optional[float] = None
         self._last_video_pts = -1
+        self.encoded_delta_bytes = 0
+        self.encoded_keyframes = 0
         self._audio_capture_epoch = 0
         self._audio_cb_epoch = -1
         self._audio_pts_offset = 0
@@ -616,6 +623,10 @@ class MediaPipelinePixel(MediaPipeline):
         static hold, whose lateness gate reads the hop from the capture thread.
         A frame can move the hold's next deadline earlier, so it wakes the
         hold's timer task."""
+        if keyframe:
+            self.encoded_keyframes += 1
+        else:
+            self.encoded_delta_bytes += len(data)
         self.produce_data(data, pts, "video", keyframe)
         try:
             self.static_hold.frame(header, data, time.monotonic() - delivered_at)
