@@ -186,6 +186,10 @@ IDR_REQUEST_FLOOR_S = 0.25
 # own, so an encoder that ignores requests degrades to a smear rather than
 # a dead stream.
 GATE_TIMEOUT_S = 1.0
+# A video bridge whose consumer has not read for this long (an RTC peer still
+# connecting, or one that stopped) asks for no keyframe: the request lands on
+# the display's shared encoder and re-keys every other viewer for nobody.
+CONSUMER_IDLE_S = 0.5
 # A viewer's report of the protocol its selected candidate pair runs on
 # (`_path,udp|tcp|tls`, anything else is unknown), which the static hold's
 # link verdict reads.
@@ -284,6 +288,12 @@ class PipelineBridge:
     a keyframe is asked for until one arrives and reopens it, and a queued
     keyframe is never evicted by a delta frame. A gate no keyframe answers
     within GATE_TIMEOUT_S reopens on its own.
+
+    Keyframes are asked for only on behalf of a consumer that reads. Until an
+    RTC peer connects nothing drains the bridge and every frame overflows it;
+    asking then would re-key the shared encoder every IDR_REQUEST_FLOOR_S for
+    the display's other viewers. The gate stays closed while the consumer is
+    idle and its timeout runs from the read that resumes it.
     """
     def __init__(self, maxsize: int = 1,
                  request_keyframe: Optional[Callable[[], None]] = None,
@@ -294,8 +304,8 @@ class PipelineBridge:
             maxsize: Queue depth; 1 means latest-wins, larger is drop-oldest.
             request_keyframe: Asks the display's encoder for a keyframe, on
                 the loop thread, at most once per IDR_REQUEST_FLOOR_S while
-                the gate is closed. None leaves every item ungated: audio
-                samples are self-contained.
+                the gate is closed and the consumer reads. None leaves every
+                item ungated: audio samples are self-contained.
             clock: Monotonic time source.
 
         Attributes:
@@ -311,6 +321,8 @@ class PipelineBridge:
         self._queued_keyframe = False
         self._gated_at: Optional[float] = None
         self._last_request: Optional[float] = None
+        self._readers = 0
+        self._last_read: Optional[float] = None
         self.dropped = 0
 
     def set_data(self, data: Any, keyframe: bool = True) -> None:
@@ -344,7 +356,7 @@ class PipelineBridge:
             return
         now = self._clock()
         if self._gated_at is not None:
-            if now - self._gated_at < GATE_TIMEOUT_S:
+            if now - self._gated_at < GATE_TIMEOUT_S or not self._reading(now):
                 self.dropped += 1
                 self._ask(now)
                 return
@@ -359,7 +371,13 @@ class PipelineBridge:
         queue.put_nowait(data)
         self._queued_keyframe = False
 
+    def _reading(self, now: float) -> bool:
+        return self._readers > 0 or (
+            self._last_read is not None and now - self._last_read < CONSUMER_IDLE_S)
+
     def _ask(self, now: float) -> None:
+        if not self._reading(now):
+            return
         if self._last_request is not None and now - self._last_request < IDR_REQUEST_FLOOR_S:
             return
         self._last_request = now
@@ -369,8 +387,20 @@ class PipelineBridge:
         return self._queue.empty()
 
     async def get_data(self) -> Any:
-        """Wait until an item is available in the queue and return it."""
-        return await self._queue.get()
+        """Wait until an item is available in the queue and return it. A
+        consumer that starts or resumes reading behind a closed gate asks for
+        the keyframe that reopens it."""
+        now = self._clock()
+        if self._gated_at is not None and not self._reading(now):
+            self._gated_at = now
+        self._readers += 1
+        if self._gated_at is not None:
+            self._ask(now)
+        try:
+            return await self._queue.get()
+        finally:
+            self._readers -= 1
+            self._last_read = self._clock()
 
 class AudioMedia(AudioStreamTrack):
     """Audio track that serves pre-encoded packets from a `PipelineBridge`."""
