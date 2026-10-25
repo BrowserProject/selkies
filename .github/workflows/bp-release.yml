@@ -1,0 +1,80 @@
+# A release: tag bp-<upstream short sha>-<n> on bp/main (REBASE.md). Runs the
+# fork's CI for the tag, attests the wheel and the client package, publishes
+# the client to GitHub Packages and creates the GitHub release with both and
+# the changelog.
+name: bp release
+
+on:
+  push:
+    tags: ["bp-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/bp-ci.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets: inherit
+
+  release:
+    name: Release ${{ github.ref_name }}
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check the tag against the history
+        id: base
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          base=$(git rev-parse --verify "$(echo "$TAG" | cut -d- -f2)^{commit}")
+          git merge-base --is-ancestor "$base" "$TAG"
+          git merge-base --is-ancestor "$TAG" origin/bp/main
+          # Everything on top of the upstream base is ours, one bp commit each.
+          if git log --format=%s "$base..$TAG" | grep -v '^bp[ :]'; then
+            echo "::error::commits above the upstream base without the bp prefix"; exit 1
+          fi
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: artifacts/*
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: https://npm.pkg.github.com
+          scope: "@browserproject"
+      - name: Publish @browserproject/selkies-client
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # ./ makes it a file: npm reads artifacts/<name> as a GitHub repository.
+        run: npm publish ./artifacts/*.tgz --tag bp
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          BASE: ${{ steps.base.outputs.sha }}
+        run: |
+          {
+            echo "Upstream base: selkies-project/selkies@${BASE}"
+            echo
+            echo "Artifacts: the Python wheel (without the upstream web bundle) and"
+            echo "@browserproject/selkies-client on GitHub Packages, both with build"
+            echo "provenance attestations."
+            echo
+            echo "Commits on top of the base:"
+            git log --reverse --format='- %s' "${BASE}..${TAG}"
+          } > CHANGELOG.md
+          gh release create "$TAG" artifacts/* --title "$TAG" --notes-file CHANGELOG.md --verify-tag

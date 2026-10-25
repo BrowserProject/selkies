@@ -1,0 +1,140 @@
+# The fork's CI: the wheel, its install on Debian trixie, the patch and
+# product test suites, and the client package. bp-release.yml runs it for a
+# release tag.
+name: bp CI
+
+on:
+  push:
+    branches: [bp/main, "bp/rebase-*"]
+  pull_request:
+    branches: [bp/main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: Release tag (bp-<upstream short sha>-<n>), empty for a development build
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bp-ci-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TRIXIE: debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+
+jobs:
+  version:
+    name: Versions
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.v.outputs.python }}
+      npm: ${{ steps.v.outputs.npm }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        env:
+          TAG: ${{ inputs.version }}
+        run: bp/version.sh "$TAG" >> "$GITHUB_OUTPUT"
+
+  wheel:
+    name: Wheel
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the wheel (without the upstream web bundle)
+        env:
+          VERSION: ${{ needs.version.outputs.python }}
+        run: |
+          sed -i "s|^version =.*|version = \"${VERSION}\"|" pyproject.toml
+          docker run --rm -v "$PWD:/src" -w /src "$TRIXIE" sh -euc '
+            apt-get update -qq && apt-get install -qq -y --no-install-recommends python3-venv >/dev/null
+            python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q build
+            /tmp/venv/bin/python -m build --wheel --outdir dist .'
+          ls -la dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: selkies-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  install:
+    name: Wheel installs on Debian trixie
+    needs: wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: selkies-wheel
+          path: dist
+      - run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" "$TRIXIE" sh -euc '
+            apt-get update -qq && apt-get install -qq -y --no-install-recommends python3-venv >/dev/null
+            python3 -m venv /tmp/venv
+            /tmp/venv/bin/pip install -q /dist/*.whl
+            cd /tmp && /tmp/venv/bin/python -c "import selkies, selkies.connection_scopes; print(\"import selkies ok\")"'
+
+  tests:
+    name: Patch and product test suites
+    needs: wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Product modules available
+        id: ext
+        env:
+          TOKEN: ${{ secrets.BP_SELKIES_EXT_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning title=Patch tests skipped::BP_SELKIES_EXT_TOKEN is not set, so the product modules of BrowserProject/browser (containers/browser-base/selkies-ext) cannot be read and the suites, which import them, do not run here. BrowserProject/browser runs them against every pinned release (job selkies-ext)."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.ext.outputs.present == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: BrowserProject/browser
+          token: ${{ secrets.BP_SELKIES_EXT_TOKEN }}
+          path: browser
+          sparse-checkout: containers
+      - if: steps.ext.outputs.present == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: selkies-wheel
+          path: dist
+      - if: steps.ext.outputs.present == 'true'
+        name: Run the suites
+        run: |
+          docker build -q -t bp-selkies-test -f bp/test.Dockerfile \
+            $(grep -v '^#' bp/flux.env | sed 's/^/--build-arg /') bp
+          docker run --rm -v "$PWD:/fork" -w /fork bp-selkies-test \
+            bp/run-tests.sh --ext browser/containers/browser-base/selkies-ext \
+              dist/*.whl tests/bp browser/containers/browser-base/selkies-ext/tests
+
+  client:
+    name: Client package
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Pack @browserproject/selkies-client
+        env:
+          VERSION: ${{ needs.version.outputs.npm }}
+        run: |
+          npm ci --prefix bp/client/tools --no-audit --no-fund
+          node bp/client/pack.mjs "$VERSION" client
+          node --input-type=module -e "import('./client/lib/stream-policy.js').then((m) => { if (typeof m.streamCap !== 'function') process.exit(1); })"
+          mkdir -p packed && npm pack ./client --pack-destination packed
+      - uses: actions/upload-artifact@v7
+        with:
+          name: selkies-client
+          path: packed/*.tgz
+          if-no-files-found: error
