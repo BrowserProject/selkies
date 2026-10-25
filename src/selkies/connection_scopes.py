@@ -16,7 +16,9 @@ channel it negotiates (which never passes the relay), and the file routes.
   every role gate (mode switch, SETTINGS, microphone, webcam, controller
   slots) treats it as a viewer, and its input messages are dropped on top of
   that. In secure mode (a master token) the session tokens keep deciding the
-  role; the input and clipboard verbs are dropped there all the same.
+  role; the input and clipboard verbs are dropped there all the same. As a
+  viewer it is a shared viewer, so ``enable_shared`` (on by default) must stay
+  on for the WebSocket transports to admit it.
 - ``clipboard``: clipboard writes and reads in both directions, including the
   server's clipboard announcements.
 - ``files``: ``/api/upload`` and ``/api/files``.

@@ -270,8 +270,8 @@ def dispatch_client_message(
     The chain both transports share, in order: a gzip'd payload is inflated
     with a bound (the transport's own size limit caps only the compressed
     size); a message needing a scope the connection lacks is dropped
-    (`connection_scopes`); the `_gz,1` handshake marks the connection for gzip'd sends and is
-    echoed; STOP_AUDIO/START_AUDIO pause this connection alone and are taken
+    (`connection_scopes`); the `_gz,1` handshake marks the connection for
+    gzip'd sends and is echoed; STOP_AUDIO/START_AUDIO pause this connection alone and are taken
     ahead of the viewer gate (audio is per consumer on both transports now, so
     a hidden viewer may mute itself); a viewer's SETTINGS snapshot is
     connection sync only and never applied; a viewer may send only the
