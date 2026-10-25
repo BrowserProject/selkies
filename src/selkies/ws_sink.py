@@ -139,6 +139,22 @@ STATS_PUSH_INTERVAL_S = 2.0
 # a queue that is actually building.
 BACKLOG_GROWTH_MIN_BYTES = 64 * 1024
 
+# What a client's own acks say about its path. The socket takes a frame long
+# before the viewer has it: the kernel, the Go proxy and nginx buffer megabytes
+# between them, so the write-side goodput and the relay backlog only see a queue
+# once seconds of stream stand in it. The ack round trip sees it at once: its
+# excess over the path's base round trip is queue delay, which the congestion
+# loop takes like a peer's TWCC queue delay, and a frame still unacknowledged
+# SINK_QUEUE_BUDGET_S past the base stops the client's video until the queue has
+# drained (it resumes on a keyframe). The base is the least round trip over
+# SINK_RTT_FLOOR_WINDOW_S: long enough that a standing queue never becomes the
+# base, short enough to follow a new route. A hold lasts until nothing is
+# outstanding, never longer than SINK_HOLD_MAX_S: a client that stops acking
+# frames it received must not freeze for good.
+SINK_QUEUE_BUDGET_S = 0.3
+SINK_RTT_FLOOR_WINDOW_S = 120.0
+SINK_HOLD_MAX_S = 2.0
+
 # Bounded audio fan-out, sized like the websockets service's queue.
 AUDIO_QUEUE_MAX = 120
 
@@ -353,6 +369,10 @@ class WsClient:
         consumer: The consumer entry `_display_consumers` publishes, with the
             same `video_paused`/`audio_paused` fields a peer entry carries.
         last_ack: Last frame id this client acknowledged.
+        tick_rtt: The least ack round trip of the current congestion tick.
+        held_since: When the client's video was held for a full queue, else None.
+        resyncing: Held video resumes on a keyframe; the deltas its relay drops
+            until then are the hold's doing, not congestion.
     """
 
     __slots__ = ("conn_id", "ws", "role", "token", "slot", "remote_address",
@@ -360,7 +380,7 @@ class WsClient:
                  "display_id", "session_peer_id", "consumer", "relay", "host",
                  "last_ack", "gz", "closing", "clip_lock", "_next_idr",
                  "goodput_bps", "loss", "_last_bytes", "_last_tick",
-                 "_last_backlog",
+                 "_last_backlog", "tick_rtt", "_rtt_floor", "held_since", "resyncing",
                  "mic_notified", "cam_notified", "js_notified")
 
     def __init__(self, conn_id: str, ws: web.WebSocketResponse, role: str,
@@ -395,6 +415,12 @@ class WsClient:
         self._last_bytes = 0
         self._last_tick = time.monotonic()
         self._last_backlog = None
+        self.tick_rtt: Optional[float] = None
+        # Round trips that can still be the windowed least: increasing
+        # (time, seconds) pairs, the head being the base.
+        self._rtt_floor: deque = deque()
+        self.held_since: Optional[float] = None
+        self.resyncing = False
         self.mic_notified = False
         self.cam_notified = False
         self.js_notified = False
@@ -415,6 +441,62 @@ class WsClient:
         """This client's ack/RTT state, the entry the relay stamps sends into."""
         return self.host.display_clients[self.display_id]
 
+    @property
+    def base_rtt(self) -> Optional[float]:
+        """The path's round trip without a queue: the least ack round trip in
+        SINK_RTT_FLOOR_WINDOW_S, None before the first ack."""
+        return self._rtt_floor[0][1] if self._rtt_floor else None
+
+    def note_rtt(self, rtt_s: float, now: float) -> None:
+        """One ack round trip, for this tick's least and the windowed base."""
+        self.tick_rtt = rtt_s if self.tick_rtt is None else min(self.tick_rtt, rtt_s)
+        floor = self._rtt_floor
+        while floor and floor[-1][1] >= rtt_s:
+            floor.pop()
+        floor.append((now, rtt_s))
+        while floor[0][0] < now - SINK_RTT_FLOOR_WINDOW_S:
+            floor.popleft()
+
+    def inflight_age(self, now: float) -> float:
+        """How long the oldest frame this client has not acknowledged has been
+        on its way, 0 with nothing outstanding. `_note_ack` keeps only
+        unacknowledged frames in `sent_timestamps`, oldest first."""
+        sent = self.display_state["sent_timestamps"]
+        return now - next(iter(sent.values())) if sent else 0.0
+
+    def queue_full(self, now: float) -> bool:
+        """The oldest unacknowledged frame is SINK_QUEUE_BUDGET_S past the
+        path's base round trip: the buffers between here and the viewer hold
+        that much stream, and anything sent now would reach it that much late.
+        Never before the first ack, whose round trip is the first base."""
+        base = self.base_rtt
+        return base is not None and self.inflight_age(now) - base > SINK_QUEUE_BUDGET_S
+
+    def hold_video(self, now: float) -> bool:
+        """Whether this client's video is held: from a full queue until every
+        frame on its way was acknowledged (or SINK_HOLD_MAX_S passed), so the
+        hold does not flap at the budget's edge and drop the keyframe the
+        client resumes on."""
+        if self.held_since is None:
+            if not self.queue_full(now):
+                return False
+            self.held_since = now
+            self.resyncing = True
+            return True
+        if self.display_state["sent_timestamps"] and now - self.held_since < SINK_HOLD_MAX_S:
+            return True
+        self.held_since = None
+        self.display_state["sent_timestamps"].clear()
+        return False
+
+    def forget_inflight(self) -> None:
+        """Video paused or resumed: what was on its way is no longer awaited,
+        and the video resumes on a keyframe."""
+        self.display_state["sent_timestamps"].clear()
+        self.tick_rtt = None
+        self.held_since = None
+        self.resyncing = True
+
     def want_idr(self) -> bool:
         """Rate-limit this client's keyframe requests to one per three seconds: an
         unthrottled recovery loop would drive keyframe bursts for the RTC peers
@@ -431,8 +513,11 @@ class WsClient:
 
         Goodput is what the relay actually put on the socket, smoothed; loss is
         raised for a tick in which the relay dropped a backlog or is still
-        holding one past half its budget. Both are what the shared loop already
-        understands, so no new policy enters the loop with the sink.
+        holding one past half its budget; queue delay is the tick's least ack
+        round trip over the base, or, without an ack in the tick, how long the
+        oldest outstanding frame has been on its way. All three are what the
+        shared loop already understands, so no new policy enters the loop with
+        the sink.
         """
         now = time.monotonic()
         elapsed = now - self._last_tick
@@ -477,10 +562,18 @@ class WsClient:
             self._last_backlog = backlog
         else:
             self._last_backlog = None
+        queue_delay = 0.0
+        base = self.base_rtt
+        if base is not None:
+            lag = self.tick_rtt if self.tick_rtt is not None else self.inflight_age(now)
+            queue_delay = max(0.0, lag - base)
+        self.tick_rtt = None
         if self.video_paused:
             self.goodput_bps = 0
             self._last_backlog = None
-        return {"goodput_bps": self.goodput_bps, "loss_fraction": loss}
+            queue_delay = 0.0
+        return {"goodput_bps": self.goodput_bps, "loss_fraction": loss,
+                "queue_delay_s": queue_delay}
 
 
 class WsSink:
@@ -813,11 +906,12 @@ class WsSink:
                     await self._send_text(client, f"cursor,{json.dumps(cursor)}")
 
     def merge_congestion(self, per_display: Dict[str, Dict[str, Any]]) -> None:
-        """Fold the sink clients' goodput and loss into the congestion loop's
-        per-display buckets, the same shape a peer's TWCC window produces. The
-        loop's own rule (follow the slowest consumer, back off on loss) then
-        covers WS clients with no further change; with no client connected
-        nothing is added and the loop is what it was."""
+        """Fold the sink clients' goodput, loss and queue delay into the
+        congestion loop's per-display buckets, the same shape a peer's TWCC
+        window produces. The loop's own rule (follow the slowest consumer, back
+        off on loss or queue delay) then covers WS clients with no further
+        change; with no client connected nothing is added and the loop is what
+        it was."""
         for client in self.clients.values():
             try:
                 window = client.take_window()
@@ -827,10 +921,11 @@ class WsSink:
             if window is None or client.video_paused or client.closing:
                 continue
             bucket = per_display.setdefault(
-                client.display_id, {"goodputs": [], "worst_loss": 0.0})
+                client.display_id, {"goodputs": [], "worst_loss": 0.0, "worst_delay": 0.0})
             if window["goodput_bps"]:
                 bucket["goodputs"].append(window["goodput_bps"])
             bucket["worst_loss"] = max(bucket["worst_loss"], window["loss_fraction"])
+            bucket["worst_delay"] = max(bucket.get("worst_delay", 0.0), window["queue_delay_s"])
 
     # ------------------------------------------------------------- media input
 
@@ -893,16 +988,25 @@ class WsSink:
         item = {"data": memoryview(frame), "owner": frame,
                 "frame_id": getattr(frame, "frame_id", 0) & 0xFFFF}
         need_idr = False
+        now = time.monotonic()
         for client in list(self.clients.values()):
             if client.closing or client.video_paused:
                 continue
             relay = client.relay
             if relay is None:
                 relay = self._make_relay(client)
+            if client.hold_video(now):
+                # Its relay resumes on the next keyframe, which it asks for
+                # itself once frames are offered again.
+                relay.flush_for_gate()
+                continue
             if relay.offer(item):
-                client.loss = RELAY_DROP_LOSS
+                if not client.resyncing:
+                    client.loss = RELAY_DROP_LOSS
                 if client.want_idr():
                     need_idr = True
+            if client.resyncing and relay.live_rows:
+                client.resyncing = False
             if client.ws not in client.host.clients:
                 # The relay dropped a socket it could not drain.
                 self._schedule(self._drop_client(client, "relay send failed"))
@@ -1607,13 +1711,19 @@ class WsSink:
         state["unacked_since"] = None
         sent_ts = state.get("sent_timestamps")
         if sent_ts and acked in sent_ts:
-            send_time = sent_ts.pop(acked)
+            send_time = sent_ts[acked]
+            # The ack covers every frame sent up to this one: a socket delivers
+            # in order. What stays is exactly what is still on its way.
+            while sent_ts and next(iter(sent_ts.values())) <= send_time:
+                sent_ts.popitem(last=False)
             state["acked_sent_at"] = send_time
-            rtt_ms = max(0.0, (time.monotonic() - send_time) * 1000.0 - held_ms)
+            now = time.monotonic()
+            rtt_ms = max(0.0, (now - send_time) * 1000.0 - held_ms)
             if 0 <= rtt_ms <= RTT_SAMPLE_SANE_MAX_MS:
                 samples = state["rtt_samples"]
                 samples.append(rtt_ms)
                 state["smoothed_rtt"] = sum(samples) / len(samples)
+                client.note_rtt(rtt_ms / 1000.0, now)
 
     async def _video_active(self, client: WsClient, active: bool) -> None:
         """START_VIDEO / STOP_VIDEO for this client alone: it sets the same
@@ -1622,6 +1732,7 @@ class WsSink:
         again. A resuming client always gets an IDR: its decoder needs the
         resync even when the capture never stopped."""
         client.consumer["video_paused"] = not active
+        client.forget_inflight()
         if not active and client.relay is not None:
             client.relay.flush_for_gate()
         await self.service.handle_consumers_changed(client.display_id)
