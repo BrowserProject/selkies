@@ -1,0 +1,36 @@
+{
+  "name": "@browserproject/selkies-client",
+  "version": "0.0.0-dev",
+  "description": "The Selkies viewer cores of BrowserProject, from the BrowserProject/selkies fork",
+  "license": "MPL-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrowserProject/selkies.git"
+  },
+  "sideEffects": [
+    "./selkies-ws-core.js",
+    "./selkies-wr-core.js"
+  ],
+  "exports": {
+    "./selkies-ws-core.js": {
+      "types": "./selkies-ws-core.d.ts",
+      "default": "./selkies-ws-core.js"
+    },
+    "./selkies-wr-core.js": {
+      "types": "./selkies-wr-core.d.ts",
+      "default": "./selkies-wr-core.js"
+    },
+    "./clipboard-worker.js": {
+      "types": "./clipboard-worker.d.ts",
+      "default": "./clipboard-worker.js"
+    },
+    "./lib/*.js": {
+      "types": "./lib/*.d.ts",
+      "default": "./lib/*.js"
+    }
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+}

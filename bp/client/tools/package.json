@@ -1,0 +1,8 @@
+{
+  "name": "bp-selkies-client-tools",
+  "private": true,
+  "description": "Build tooling of bp/client/pack.mjs",
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}
