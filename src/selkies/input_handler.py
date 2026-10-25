@@ -4718,6 +4718,15 @@ class WebRTCInput:
                         # A bare keycode would type the group-1 glyph; the shim
                         # locks the group around the injection instead.
                         keycode = 0
+                    elif keycode and self.keyboard and keysym not in (
+                            self.xdisplay.keycode_to_keysym(keycode, 0),
+                            self.xdisplay.keycode_to_keysym(keycode, 1)):
+                        # The keysym sits on an AltGr level (EuroSign on
+                        # AltGr+E of a German or Swiss keymap): a bare keycode
+                        # would type the base glyph, so the shim presses it
+                        # with the modifiers its level needs. Base and Shift
+                        # levels keep the bare keycode and the client's Shift.
+                        keycode = 0
                     if keycode:
                         xtest.fake_input(
                             self.xdisplay,
