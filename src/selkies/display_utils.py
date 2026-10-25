@@ -1599,17 +1599,54 @@ async def _get_new_res_xrandr(
     return curr_res, new_res, resolutions, max_res_str, screen_name
 
 
+def _sync_screen_max() -> Tuple[int, int]:
+    """Blocking query of the largest screen RandR can set (its size range)."""
+    with _x11_lock:
+        try:
+            reply = randr.get_screen_size_range(_module_display().screen().root)
+            return int(reply.max_width), int(reply.max_height)
+        except Exception as e:
+            if not isinstance(e, x11_error.XError):
+                _drop_module_display()
+            raise
+
+
+async def _fit_screen_max(res_str: str) -> str:
+    """``res_str`` cut to the largest screen the X server can show.
+
+    Xvfb's framebuffer is fixed at its start size, which is the RandR maximum:
+    a larger mode never attaches to the output, so the resize would fail on
+    every retry and leave the unattached mode behind, which the xrandr
+    fallback then cannot create again. Each axis over the maximum is cut to
+    it, the width to the 8-pixel CVT cell below so the snapped mode fits too.
+    """
+    try:
+        w, h = (int(p) for p in res_str.split("x"))
+        max_w, max_h = await asyncio.to_thread(_sync_screen_max)
+    except Exception:
+        return res_str
+    if w <= max_w and h <= max_h:
+        return res_str
+    fitted = f"{min(w, max_w - max_w % 8)}x{min(h, max_h)}"
+    logger_app_resize.info(
+        f"'{res_str}' exceeds the {max_w}x{max_h} screen maximum; applying '{fitted}'."
+    )
+    return fitted
+
+
 async def resize_display(res_str: str) -> Optional[Tuple[int, int]]:
     """Resize the display to ``res_str`` (e.g. "2560x1280").
 
     Native RandR first (mode created from CVT-RB timings when absent), with
-    the xrandr/cvt subprocess chain as fallback.
+    the xrandr/cvt subprocess chain as fallback. A request beyond the X
+    server's maximum screen realizes the largest size that fits.
 
     Returns:
         The realized ``(width, height)`` — CVT cell alignment may make it
         wider than requested — or None on failure. Callers must capture and
         report the realized size, not the request.
     """
+    res_str = await _fit_screen_max(res_str)
     try:
         w, h = await asyncio.to_thread(_sync_resize_randr, res_str)
     except RuntimeError as e:
