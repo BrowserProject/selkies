@@ -1693,7 +1693,9 @@ class RTCApp:
     def on_pli(self, client_peer_id: str, client_type: str) -> None:
         """Translate a peer's RTP PLI into an IDR request for its display."""
         logger.debug("PLI occurred, triggering IDR frame request", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
-        peer_obj = self.peer_connections.get(client_peer_id) or {}
+        peer_obj = self.peer_connections.get(client_peer_id)
+        if not peer_obj or peer_obj.get("video_paused"):
+            return
         display_id = peer_obj.get("display_id") or "primary"
         asyncio.run_coroutine_threadsafe(self.request_idr_frame(display_id), self.async_event_loop)
 

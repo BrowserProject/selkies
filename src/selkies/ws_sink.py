@@ -388,7 +388,7 @@ class WsClient:
         self.loss = 0.0
         self._last_bytes = 0
         self._last_tick = time.monotonic()
-        self._last_backlog = 0
+        self._last_backlog = None
         self.mic_notified = False
         self.cam_notified = False
         self.js_notified = False
@@ -436,9 +436,9 @@ class WsClient:
         self._last_tick = now
         bps = (sent * 8.0) / elapsed
         smoothed = (GOODPUT_SMOOTHING * self.goodput_bps
-                    + (1.0 - GOODPUT_SMOOTHING) * bps)
+                    + (1.0 - GOODPUT_SMOOTHING) * bps) if self.goodput_bps else bps
         relay = self.relay
-        if relay is not None and relay.backlog_bytes > 0:
+        if relay is not None and relay.backlog_bytes > 0 and self.goodput_bps > 0:
             # Still behind: the bytes that left in this tick are a backlog
             # draining, not room on the link. Letting that raise the estimate
             # made the loop climb again the moment the queue moved, so the
@@ -460,13 +460,16 @@ class WsClient:
             # otherwise read as congestion and hold the encoder down on a
             # healthy link. Only growth past a real step counts.
             step = max(BACKLOG_GROWTH_MIN_BYTES, relay.budget // 100)
-            if backlog > 0 and backlog - self._last_backlog > step:
+            if self._last_backlog is not None and backlog > 0 and backlog - self._last_backlog > step:
                 loss = max(loss, RELAY_DROP_LOSS)
             if backlog > relay.budget // 2:
                 loss = max(loss, RELAY_DROP_LOSS)
             self._last_backlog = backlog
         else:
-            self._last_backlog = 0
+            self._last_backlog = None
+        if self.video_paused:
+            self.goodput_bps = 0
+            self._last_backlog = None
         return {"goodput_bps": self.goodput_bps, "loss_fraction": loss}
 
 
@@ -806,8 +809,12 @@ class WsSink:
         covers WS clients with no further change; with no client connected
         nothing is added and the loop is what it was."""
         for client in self.clients.values():
-            window = client.take_window()
-            if window is None:
+            try:
+                window = client.take_window()
+            except Exception:
+                logger.exception("Sink feedback failed (display %s)", client.display_id)
+                continue
+            if window is None or client.video_paused or client.closing:
                 continue
             bucket = per_display.setdefault(
                 client.display_id, {"goodputs": [], "worst_loss": 0.0})

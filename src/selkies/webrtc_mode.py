@@ -2569,8 +2569,12 @@ class WebRTCService(BaseStreamingService):
                     except Exception:
                         logger.exception("_ensure_pacer failed (display %s)", did)
                 transport = getattr(getattr(pc, "sctp", None), "transport", None)
-                window = transport.take_twcc_window() if transport is not None else None
-                if window is None:
+                try:
+                    window = transport.take_twcc_window() if transport is not None else None
+                except Exception:
+                    logger.exception("Peer feedback failed (display %s)", did)
+                    continue
+                if window is None or peer.get("video_paused"):
                     continue
                 bucket = per_display.setdefault(
                     did, {"goodputs": [], "worst_loss": 0.0, "worst_delay": 0.0})
