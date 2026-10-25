@@ -142,6 +142,12 @@ BACKLOG_GROWTH_MIN_BYTES = 64 * 1024
 # Bounded audio fan-out, sized like the websockets service's queue.
 AUDIO_QUEUE_MAX = 120
 
+# A frame that finds the client's previous one still in flight is dropped, but
+# only a send outstanding for longer than this is congestion. A loop stall of a
+# few frames queues them behind a send that has not even started, and reading
+# that as loss held the shared encoder at its floor on a healthy link.
+AUDIO_STALL_LOSS_S = 0.1
+
 # Drain deadline for the shutdown lifecycle (patch 0005 parity).
 SHUTDOWN_DRAIN_S = 5.0
 
@@ -350,7 +356,7 @@ class WsClient:
     """
 
     __slots__ = ("conn_id", "ws", "role", "token", "slot", "remote_address",
-                 "audio_inflight",
+                 "audio_inflight", "audio_inflight_since",
                  "display_id", "session_peer_id", "consumer", "relay", "host",
                  "last_ack", "gz", "closing", "clip_lock", "_next_idr",
                  "goodput_bps", "loss", "_last_bytes", "_last_tick",
@@ -394,6 +400,7 @@ class WsClient:
         self.js_notified = False
         # One audio frame in flight per client at a time; see _audio_fanout.
         self.audio_inflight = False
+        self.audio_inflight_since = 0.0
 
     @property
     def video_paused(self) -> bool:
@@ -458,9 +465,12 @@ class WsClient:
             # Hysteresis: a single frame in flight makes the backlog wobble by
             # its own size from tick to tick, and every upward wobble would
             # otherwise read as congestion and hold the encoder down on a
-            # healthy link. Only growth past a real step counts.
+            # healthy link. Only growth past a real step counts, and only on a
+            # backlog that already stood past that step at the last tick: one
+            # keyframe still leaving at the tick boundary is gone by the next.
             step = max(BACKLOG_GROWTH_MIN_BYTES, relay.budget // 100)
-            if self._last_backlog is not None and backlog > 0 and backlog - self._last_backlog > step:
+            if (self._last_backlog is not None and self._last_backlog > step
+                    and backlog - self._last_backlog > step):
                 loss = max(loss, RELAY_DROP_LOSS)
             if backlog > relay.budget // 2:
                 loss = max(loss, RELAY_DROP_LOSS)
@@ -969,9 +979,11 @@ class WsSink:
                         # real-time, a late frame is worth nothing, and the
                         # congestion loop reads the loss and lowers the shared
                         # bitrate that is drowning the client.
-                        client.loss = max(client.loss, RELAY_DROP_LOSS)
+                        if time.monotonic() - client.audio_inflight_since > AUDIO_STALL_LOSS_S:
+                            client.loss = max(client.loss, RELAY_DROP_LOSS)
                         continue
                     client.audio_inflight = True
+                    client.audio_inflight_since = time.monotonic()
                     self._schedule(self._deliver_audio(client, payload))
                 self._audio_queue.task_done()
         except asyncio.CancelledError:
