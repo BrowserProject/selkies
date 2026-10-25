@@ -51,6 +51,7 @@ from .Xlib import error as x11_error
 from .Xlib.ext import randr
 from .Xlib.ext import res as xres
 from .Xlib.protocol import request as x11_request
+from .stream_profiles import DISPLAY_REFRESH_HZ
 
 import logging
 
@@ -280,6 +281,17 @@ def _sync_query_randr() -> Tuple[str, List[str], str]:
             raise
 
 
+def _exact_refresh_clock(h_total: int, v_total: int, refresh: int) -> int:
+    """Dot clock in Hz that makes a mode refresh at exactly ``refresh``.
+
+    The browsers render at the display refresh and the capture ticks at exactly
+    the stream rate on the same monotonic clock, so a mode a few hundredths of a
+    hertz off (CVT rounds the clock to 250 kHz) beats against it and now and then
+    duplicates or skips a frame.
+    """
+    return refresh * h_total * v_total
+
+
 def _ensure_mode_on_display(
     d: x11_display.Display,
     root: Any,
@@ -306,7 +318,8 @@ def _ensure_mode_on_display(
         return mode_id, w, h
     mode_id = next((mid for mid, n in names.items() if n == res_str), None)
     if mode_id is None:
-        info = _cvt_rb_mode_info(w_req, h_req)
+        info = _cvt_rb_mode_info(w_req, h_req, DISPLAY_REFRESH_HZ)
+        info["dot_clock"] = _exact_refresh_clock(info["h_total"], info["v_total"], DISPLAY_REFRESH_HZ)
         info["id"] = 0
         info["name_length"] = len(res_str)
         mode_id = randr.create_mode(root, info, res_str).mode
@@ -1779,14 +1792,14 @@ _MODELINE_CACHE: Dict[Tuple[str, int], Tuple[str, str]] = {}
 
 
 async def generate_xrandr_gtf_modeline(
-    res_wh_str: str, refresh_hz: int = 60
+    res_wh_str: str, refresh_hz: int = DISPLAY_REFRESH_HZ
 ) -> Tuple[str, str]:
     """Generate an xrandr modeline using cvt, falling back to gtf.
 
-    ``refresh_hz`` defaults to 60 (the rate selkies requests for display
-    modes); it is part of the cache key so a mode generated at another rate
-    gets its own timings rather than a stale 60 Hz modeline for the same
-    size. Successful results are memoized so a size/refresh computed once
+    ``refresh_hz`` defaults to the session's display refresh; it is part of the
+    cache key so a mode generated at another rate gets its own timings. The
+    tool's rounded clock is replaced by the exact one for that rate.
+    Successful results are memoized so a size/refresh computed once
     never re-spawns the cvt/gtf subprocess, including when the X mode was
     later dropped and has to be re-created on a subsequent reconfigure.
 
@@ -1844,7 +1857,14 @@ async def generate_xrandr_gtf_modeline(
         raise Exception(
             f"Could not parse modeline from {tool_name} output: {modeline_output}"
         )
-    result = (match.group(1).strip(), match.group(2))
+    params = match.group(2).split()
+    try:
+        params[0] = f"{_exact_refresh_clock(int(params[4]), int(params[8]), refresh_hz) / 1_000_000:.6f}"
+    except (IndexError, ValueError) as e:
+        raise Exception(
+            f"Could not parse modeline timings from {tool_name} output: {modeline_output}"
+        ) from e
+    result = (match.group(1).strip(), " ".join(params))
     _MODELINE_CACHE[cache_key] = result
     return result
 
