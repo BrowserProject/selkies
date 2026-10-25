@@ -402,15 +402,15 @@ class RTCApp:
     Attributes:
         peer_connections: Peer id to peer entry, one per connected browser
             page: `peer_conn`, `data_channel`, `client_type`, `display_id`;
-            `client_token` and `client_slot` as held at connect — the token's
-            slot in secure mode, else the one the peer claimed at HELLO — so a
+            `client_token` and `client_slot` as held at connect - the token's
+            slot in secure mode, else the one the peer claimed at HELLO - so a
             revocation or handoff on `/api/tokens` can find the affected peers
             (per-message checks read the live store); `channel_consumers`,
             cancellable from teardown because a channel that never reached
             SCTP-established emits no close; `mic_state` and `webcam_state`,
             this peer's own uplink sinks (None without the m-line), retired
             per peer; `video_sender` and `video_paused` for the per-peer tab
-            pause — the sender's enabled flag drops frames after recv, so the
+            pause - the sender's enabled flag drops frames after recv, so the
             relay keeps draining while the peer is hidden.
         displays: Display id to media graph (`relay`, `video_bridge`,
             `video_media`, and on the primary display `audio_bridge` /
@@ -608,7 +608,7 @@ class RTCApp:
             mime_type: Payload MIME type; "text/plain" marks it as text.
             reply_to: Set to the requesting verb (e.g. "cr") when this send
                 answers a client fetch rather than announcing a server-side
-                clipboard change — the websockets `clipboard_reply,<verb>`
+                clipboard change - the websockets `clipboard_reply,<verb>`
                 contract, carried here as an extra field on the clipboard-msg
                 / clipboard-msg-start payload so the client can treat the
                 payload cache-only without time heuristics (old clients ignore
@@ -737,8 +737,8 @@ class RTCApp:
         """Send a system action (e.g. ``command_error,<text>``) to clients.
 
         With a `peer_id` whose channel is still open, only that peer is
-        addressed (requester-scoped feedback); otherwise — including a
-        requester that reconnected under a new peer id — the action is
+        addressed (requester-scoped feedback); otherwise - including a
+        requester that reconnected under a new peer id - the action is
         broadcast, and shared-mode viewers suppress it client-side.
         """
         if peer_id is not None:
@@ -850,7 +850,7 @@ class RTCApp:
         return conn_state == "connected" and data_channel_state == "open", peer_obj.get("data_channel")
 
     def _iter_open_data_channels(self) -> Iterator[RTCDataChannel]:
-        """Yield every connected peer's open data channel — controllers and
+        """Yield every connected peer's open data channel - controllers and
         viewers, all displays."""
         for peer_obj in self.peer_connections.values():
             peer_conn = peer_obj.get("peer_conn")
@@ -903,7 +903,7 @@ class RTCApp:
     def __send_data_channel_message(self, msg_type: str, data: Any) -> None:
         """Broadcast a typed message to every connected peer.
 
-        All display controllers and viewers receive it — the websockets
+        All display controllers and viewers receive it - the websockets
         transport broadcasts cursor, stats, and clipboard to all of its
         clients, so the channel path must too. Channels that are not open are
         skipped.
@@ -1113,7 +1113,7 @@ class RTCApp:
         """Feed one encoded frame from the capture side into a display's bridge.
 
         Synchronous: scheduled via `loop.call_soon_threadsafe` from the capture
-        thread, since `set_data` does not await — no per-frame Future/Task.
+        thread, since `set_data` does not await - no per-frame Future/Task.
         `EncodedPacket` references the encoder buffer without copying and the
         packers walk it as a memoryview, so no per-frame FFmpeg object is
         allocated and no whole-frame copy is taken.
@@ -1335,7 +1335,7 @@ class RTCApp:
                     forced_codec_mime: str) -> None:
         """Restrict a sender's codec preferences to one MIME type plus RTX.
 
-        Every codec matching the MIME type stays eligible — H.264 appears once
+        Every codec matching the MIME type stays eligible - H.264 appears once
         per advertised profile. FlexFEC rides along when the receiver supports
         it (Chrome family); a receiver without it answers without the codec and
         the sender emits no repair stream.
@@ -1444,10 +1444,10 @@ class RTCApp:
         Delivered as a `system` action (the channel is JSON-typed):
         `mk_access,1` attaches the client's input context, `mk_access,0`
         detaches it. Sent to controllers as well as viewers (websockets
-        MK_ACCESS parity) — an mk handoff strips a controller's input
+        MK_ACCESS parity) - an mk handoff strips a controller's input
         authority too, and without the verdict its page keeps a live input UI
         whose messages the server drops. No-op outside secure mode. Gated on
-        secure mode itself, NOT on an mk token existing — a handoff that
+        secure mode itself, NOT on an mk token existing - a handoff that
         clears the token must still push the 0 that detaches the previous
         holder.
         """
@@ -1486,7 +1486,7 @@ class RTCApp:
 
     def _viewer_is_collaborator(self, client_token: Optional[str]) -> bool:
         """A viewer holding the active mk (mouse+keyboard) token is a read-write
-        collaborator — mirrors the WS mk-token path — but only while enable_collab
+        collaborator - mirrors the WS mk-token path - but only while enable_collab
         is on. Fail-safe: any missing piece means not a collaborator (stays
         read-only)."""
         if not client_token:
@@ -1558,8 +1558,8 @@ class RTCApp:
         revocation or re-slot lands on the next message; otherwise from the
         peer's HELLO claim, which the signaling server validated (`-1` is its
         unassigned sentinel). A legacy controller's claim of slot 1 is registry
-        identity rather than a gamepad restriction — the websockets handshake
-        gives it no slot at all — and is dropped, so the same client in the
+        identity rather than a gamepad restriction - the websockets handshake
+        gives it no slot at all - and is dropped, so the same client in the
         same role is governed the same on both transports.
 
         Returns:
@@ -1594,8 +1594,8 @@ class RTCApp:
         only, never applied (the websockets transport likewise ignores viewer
         payloads); a viewer may send only the allow-listed messages, and a
         read-write collaborator (mk token plus enable_collab) additionally the
-        keyboard/mouse/clipboard set — the same two tiers as the websockets
-        gate, so a collaborator still cannot send cmd — with blur/visibility
+        keyboard/mouse/clipboard set - the same two tiers as the websockets
+        gate, so a collaborator still cannot send cmd - with blur/visibility
         noise dropped silently and the collaborator check reached only for
         otherwise-disallowed input so normal viewer traffic pays nothing; the
         secure-mode input and gamepad gates apply; STOP_VIDEO / START_VIDEO
@@ -1751,7 +1751,7 @@ class RTCApp:
 
         Builds the display's media graph when none exists yet, attaches the
         media tracks, the mic and webcam receivers, and the serialized input
-        channel, and registers the peer entry only after the offer was sent —
+        channel, and registers the peer entry only after the offer was sent -
         a failure before registration tears the half-built connection down
         here (consumer task and connection) because no other teardown path
         could ever find it. Registration ends with a consumers-changed
@@ -1911,7 +1911,7 @@ class RTCApp:
                             client_token: Optional[str] = None) -> Dict[str, Any]:
         """Add a recvonly mic transceiver and route its Opus into pcmflux.
 
-        The encoded payload goes straight into pcmflux — no aiortc/Python Opus
+        The encoded payload goes straight into pcmflux - no aiortc/Python Opus
         decode. RED (UDP loss resilience) is gated by audio_redundancy: when
         on, the shared caps offer it and pcmflux de-frames + loss-recovers
         each RED payload off the GIL before decoding (the RTP timestamp
@@ -1919,7 +1919,7 @@ class RTCApp:
         restricted to plain Opus and packets are decoded directly.
 
         Only a controller or a live collab (m/k) holder speaks into the
-        desktop mixer — the websockets transport's mic gate verdict — and the
+        desktop mixer - the websockets transport's mic gate verdict - and the
         collab state is read per packet so an m/k handoff takes effect without
         renegotiation. The first packet opens the pcmflux playback off the
         loop, dropping packets until it is ready; the shared SelkiesVirtualMic
@@ -1929,7 +1929,7 @@ class RTCApp:
         completes after the peer was torn down stops its playback instead of
         publishing it. pcmflux raises once its playback worker dies (e.g.
         PulseAudio restarted mid-run), so a failed write drops the chunk and
-        tears the stream down for the next packet to reopen — swallowing it
+        tears the stream down for the next packet to reopen - swallowing it
         would leave this peer's mic silent forever (websockets parity).
 
         Returns:
@@ -2021,8 +2021,8 @@ class RTCApp:
         virtual webcam.
 
         The browser encodes its camera with its own WebRTC encoder (hardware
-        where it has one) and the depacketized frames — Annex-B H.264, VP8 or
-        VP9 — go straight to pixelflux, which decodes them off the GIL; no
+        where it has one) and the depacketized frames - Annex-B H.264, VP8 or
+        VP9 - go straight to pixelflux, which decodes them off the GIL; no
         Python decode and no data-channel chunking. When the decoder asks for a
         keyframe (after a drop or a late start) the request becomes a PLI.
 
@@ -2157,7 +2157,7 @@ class RTCApp:
         The explicit-stop counterpart of the "closed" state branch. The peer
         is deregistered BEFORE its connection closes, so the state event that
         close raises finds no entry and every teardown step runs exactly once,
-        here — SESSION_END arrives as soon as the client's signaling socket
+        here - SESSION_END arrives as soon as the client's signaling socket
         drops, long before ICE gives up on the peer, and nothing may wait for
         the state machine.
 
@@ -2311,9 +2311,9 @@ class RTCApp:
         peer's socket was already gone) leaves live ICE gatherers whose STUN
         retries fire into torn-down transports. A peer that failed before it
         was registered closed its own half-built connection; what outlives it
-        is the display it claimed — the graph built for it here and, for a
+        is the display it claimed - the graph built for it here and, for a
         secondary display, the registration the owning service made before
-        the start — which no later event would release.
+        the start - which no later event would release.
         """
         if client_peer_id in self.peer_connections:
             try:

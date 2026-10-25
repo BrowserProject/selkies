@@ -164,7 +164,7 @@ class WebRTCService(BaseStreamingService):
         media_pipeline: The primary display's pipeline (also stored under the
             ``"primary"`` key of ``display_pipelines``).
         display_pipelines: One ``MediaPipelinePixel`` per connected display id.
-        display_clients: Per-secondary-display registration state — requested
+        display_clients: Per-secondary-display registration state - requested
             dimensions, position, and the display's own copies of the
             client-tunable video settings.
         display_layouts: The computed extended-desktop layout the input
@@ -699,14 +699,14 @@ class WebRTCService(BaseStreamingService):
 
     def _server_settings_payload(self) -> Dict[str, Any]:
         """get_server_settings with second_screen and ui_sidebar_show_apps
-        published as EFFECTIVE availability — the admin flag AND what the
-        backend can actually do — so dashboards never offer a second display
+        published as EFFECTIVE availability - the admin flag AND what the
+        backend can actually do - so dashboards never offer a second display
         the server would immediately refuse, nor an apps panel whose every
         button would fail. Adds the terminal the apps panel launches in, chosen
         by the session's windowing system (absent when none is installed: the
         client keeps its default), and what the apps panel already has
         installed, which no browser's own storage can answer for a session
-        opened somewhere else — absent until the runner has answered, because a
+        opened somewhere else - absent until the runner has answered, because a
         client told nothing is installed clears its own record."""
         payload = get_server_settings()
         available, _ = self._second_screen_availability()
@@ -1084,8 +1084,8 @@ class WebRTCService(BaseStreamingService):
         the next consumer retries (this also surfaces host death, where
         `reap_dead_host` flips `is_capturing` off). The pipeline start is what
         establishes the host session in host-capture mode, so the host's
-        output count — and the second-screen availability announced on
-        channel open — can first become known here and is re-published.
+        output count - and the second-screen availability announced on
+        channel open - can first become known here and is re-published.
         """
         if display_id == "primary" and self.media_pipeline:
             self._cancel_primary_stop_grace()
@@ -1115,7 +1115,7 @@ class WebRTCService(BaseStreamingService):
         """Release a display's pipeline: the primary's stop is deferred by a
         reconnect grace (a controller tab reload reconnects within a second or
         two and reuses the warm capture, and viewers/display2 keep streaming
-        throughout — websockets _teardown_if_unclaimed parity); a secondary is
+        throughout - websockets _teardown_if_unclaimed parity); a secondary is
         fully unregistered and the desktop re-laid-out at once."""
         if display_id == "primary":
             self._schedule_primary_stop_grace()
@@ -1244,7 +1244,7 @@ class WebRTCService(BaseStreamingService):
 
     async def _apply_wayland_extension(self, did: str, layouts: Dict[str, Dict[str, int]]) -> bool:
         """Realize the extended layout as compositor screens, BEFORE the
-        secondary's pipeline binds a capture — the Wayland counterpart of
+        secondary's pipeline binds a capture - the Wayland counterpart of
         apply_extended_layout.
 
         Every display is a screen of the session compositor's own, so it lays
@@ -1357,7 +1357,7 @@ class WebRTCService(BaseStreamingService):
         or keep the old mode on a GBM allocation failure), fold it into the
         pipeline/layout state the input math offsets against, and push the
         corrected size to the clients over the existing system resolution
-        message — the WR counterpart of the WS realized clamp + broadcast. The
+        message - the WR counterpart of the WS realized clamp + broadcast. The
         stream itself re-negotiates through the encoder (the track's intrinsic
         size IS the realized resolution); this closes the control-plane loop.
         The read is also a barrier: the compositor answers only after the
@@ -1463,8 +1463,8 @@ class WebRTCService(BaseStreamingService):
         START_VIDEO, websockets parity). The peer's own RTP sender gates its
         delivery; the shared capture only stops once EVERY consumer of the
         display (controller and viewers alike) is paused. A resuming peer always
-        gets an IDR — its decoder needs a resync even when the capture kept
-        running for other consumers — with PLI as the fallback."""
+        gets an IDR - its decoder needs a resync even when the capture kept
+        running for other consumers - with PLI as the fallback."""
         display_id = display_id or "primary"
         peer = self.rtc_app.peer_connections.get(peer_id) if self.rtc_app else None
         if peer is None:
@@ -1547,7 +1547,7 @@ class WebRTCService(BaseStreamingService):
         peer (signaling verdict 4002 + pipeline stop); an mk-token handoff
         pushes the new input verdict to every surviving peer over its data
         channel, controllers included (a handoff strips their authority too).
-        Per-message input authority already reads the live store — this covers
+        Per-message input authority already reads the live store - this covers
         the media stream and the client-side grant, which otherwise persist
         until the peer disconnects itself. A slot-only change keeps the peer
         but is pushed as a role_update (websockets ROLE_UPDATE parity): the
@@ -1587,7 +1587,7 @@ class WebRTCService(BaseStreamingService):
 
     async def handle_consumers_changed(self, display_id: str) -> None:
         """A peer joined or left a display's consumer set: re-evaluate the
-        all-paused stop in both directions — a departing unpaused peer cannot
+        all-paused stop in both directions - a departing unpaused peer cannot
         leave the capture running for hidden-only consumers, and a JOINING
         unpaused peer must re-open a capture the rule stopped (else a viewer
         arriving while every prior consumer is hidden gets a permanently black
@@ -1616,7 +1616,7 @@ class WebRTCService(BaseStreamingService):
     async def _resume_display_capture(self, display_id: str, pipeline: MediaPipelinePixel,
                                       why: str, idr_always: bool = False) -> None:
         """Resume a capture stopped by the all-consumers-paused rule (no-op on a
-        live or fully-stopped pipeline) and request the resync IDR — always, or
+        live or fully-stopped pipeline) and request the resync IDR - always, or
         only when the resume actually restarted the capture."""
         restarted = False
         try:
@@ -1632,7 +1632,7 @@ class WebRTCService(BaseStreamingService):
         """Refuse a secondary display the compositor cannot realize: unregister
         it, stop its pipeline, destroy its screen, and close its peers with a
         fatal signaling verdict (4000) so the client does not re-register in a
-        loop — the Wayland mirror of the X11 unrealizable-extension drop. The
+        loop - the Wayland mirror of the X11 unrealizable-extension drop. The
         primary's screen, which may sit at a 'left'/'up' offset for the
         arrangement this display anchored, goes back to the origin. Caller
         holds _display_lock."""
@@ -1681,7 +1681,7 @@ class WebRTCService(BaseStreamingService):
         """Refuse a secondary display the X server cannot fit in its root:
         unregister it, stop its pipeline, and close its peers with a fatal
         signaling verdict (4000) so the client does not reload and re-register
-        in a loop — the X11 mirror of the compositor-side drop, and the
+        in a loop - the X11 mirror of the compositor-side drop, and the
         websockets engine's KILL parity. Caller holds _display_lock.
 
         Unregistering inline rather than through stop_display_media, which
@@ -1723,7 +1723,7 @@ class WebRTCService(BaseStreamingService):
 
     async def reconfigure_displays(self) -> None:
         """Lay the extended desktop out for the connected displays and point each
-        display's capture at its region — the WR counterpart of the websockets
+        display's capture at its region - the WR counterpart of the websockets
         reconfigure engine, for the primary plus one secondary display. On
         Wayland the layout realizes as compositor outputs instead of xrandr
         monitors.
@@ -2049,8 +2049,8 @@ class WebRTCService(BaseStreamingService):
 
         Fractional DPI is legal on the shared verb (websockets parity); the
         desktop DPI property itself is integral. Bounded by the declared
-        scaling_dpi span so a client cannot drive xrdb — and, with it, the
-        cursor size and the Wayland compositor scale — to an arbitrary value.
+        scaling_dpi span so a client cannot drive xrdb - and, with it, the
+        cursor size and the Wayland compositor scale - to an arbitrary value.
         An operator-set DPI (CLI/env) governs the desktop and is never
         clobbered by a client sync. Idempotent: the dashboard and the core
         each re-assert their DPI on settings broadcasts, and every apply churns
@@ -2377,8 +2377,8 @@ class WebRTCService(BaseStreamingService):
         Encoder ceiling: the display's configured video bitrate, CBR or not.
         The shared DTLS transport is reachable via `pc.sctp` only once the
         data-channel m-line is negotiated, while media (and TWCC estimates)
-        can flow before that, so any transceiver's sender transport — the same
-        shared RTCDtlsTransport — serves as the fallback. The IDR floor is
+        can flow before that, so any transceiver's sender transport - the same
+        shared RTCDtlsTransport - serves as the fallback. The IDR floor is
         bootstrapped from the session-start keyframe: on a late attach, waiting
         for the next natural IDR would start it at 0 and reset on the first
         real burst.
@@ -2427,7 +2427,7 @@ class WebRTCService(BaseStreamingService):
         """GCC-style bitrate adaptation from transport-wide-cc receiver feedback:
         per display, follow the slowest of ITS peers' goodput estimates with
         headroom, back off multiplicatively on loss, and retarget that display's
-        encoder within the allowed video_bitrate range — one display's congested
+        encoder within the allowed video_bitrate range - one display's congested
         link never steers another's stream. Only CBR mode has a target to steer.
 
         Each peer's feedback is drained per tick, so a decision is taken over a
@@ -2524,7 +2524,7 @@ class WebRTCService(BaseStreamingService):
         (`handle_scaling` re-derives it on DPI changes); Wayland gets it via
         CaptureSettings. Logical monitors describe the layout of whichever
         transport defined them, and a live switch leaves the previous one's
-        behind — a desktop keeps tiling against a stale rectangle — so on X11
+        behind - a desktop keeps tiling against a stale rectangle - so on X11
         they are cleared; this service defines its own
         when a second display arrives and needs none for a single one.
         """
@@ -2812,7 +2812,7 @@ class WebRTCService(BaseStreamingService):
         """Register the WebRTC HTTP/WebSocket endpoints.
 
         Every endpoint lives under /api so the single nginx /api proxy rule
-        fronts them — the signaling socket included, since that location
+        fronts them - the signaling socket included, since that location
         forwards WebSocket upgrades. Paths off /api (such as a bare /turn or
         /webrtc/signaling) would sit unproxied behind the LSIO nginx: the TURN
         fetch and the signaling handshake would 404 and freeze the dashboard.
