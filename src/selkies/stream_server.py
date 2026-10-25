@@ -1921,6 +1921,19 @@ class CentralizedStreamServer:
                         self.active_task = None
 
             task.add_done_callback(_on_service_done)
+            # Give the new service its first step while the lock is still
+            # held. A service's start() clears its own shutdown event before
+            # it awaits anything, so a stop that lands between create_task and
+            # that first step is erased by the very start it was meant to
+            # cancel: the service then waits on an event nobody sets again and
+            # the next switch burns the whole grace period below before force-
+            # cancelling a half-started service. Yielding here orders the two,
+            # and the lock keeps the next switch out until it has happened.
+            await asyncio.sleep(0)
+            if task.done():
+                self.current_mode = None
+                self.active_task = None
+                await task
 
     async def _stop_service(self) -> None:
         """Stop the active service, escalating to a forced cancel on timeout.
@@ -1932,23 +1945,40 @@ class CentralizedStreamServer:
             return
         logger.info(f"Stopping service: {self.current_mode}")
 
-        await self.services[self.current_mode].stop()
-        if self.active_task:
-            try:
-                await asyncio.wait_for(self.active_task, timeout=15)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Timeout while stopping '{self.current_mode}'. Cancelling task."
-                )
-                self.active_task.cancel()
-                try:
-                    await self.active_task
-                except asyncio.CancelledError:
-                    logger.info(
-                        f"Task cancelled after timeout for '{self.current_mode}'."
+        service = self.services[self.current_mode]
+        await service.stop()
+        task = self.active_task
+        if task:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 15
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        f"Timeout while stopping '{self.current_mode}'. Cancelling task."
                     )
-                except Exception as e:
-                    logger.warning(f"Service task raised during forced stop: {e!r}")
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        logger.info(
+                            f"Task cancelled after timeout for '{self.current_mode}'."
+                        )
+                    except Exception as e:
+                        logger.warning(f"Service task raised during forced stop: {e!r}")
+                    break
+                try:
+                    # Shielded: the poll timeout must not cancel the teardown
+                    # it is waiting on, only end this wait.
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=min(0.25, remaining)
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    # Re-assert the request every poll, so a stop signal a
+                    # service dropped costs a poll interval instead of the
+                    # whole grace period and a forced cancel.
+                    await service.stop()
         self.current_mode = None
         self.active_task = None
 
