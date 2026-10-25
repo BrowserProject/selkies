@@ -55,6 +55,7 @@ except ImportError:
 from abc import ABCMeta, abstractmethod
 
 from . import session_files
+from . import session_identity
 
 
 logger = logging.getLogger("stream_server")
@@ -1697,7 +1698,9 @@ class CentralizedStreamServer:
         request: web.Request,
         handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
     ) -> web.StreamResponse:
-        """Global auth guard for every route on the server: see ``_authorize``.
+        """Global auth guard for every route on the server: a request the proxy
+        routed for another session is refused first (`session_identity`), then
+        ``_authorize`` decides.
 
         A refusal is deliberately taken before the request's body is read -- an
         unauthenticated upload must not be paid for -- so the connection is closed
@@ -1705,10 +1708,12 @@ class CentralizedStreamServer:
         server parse them as the next request's method, which fails that request
         and every later one on the same connection.
         """
-        sink_handler = self._ws_sink_handler(request)
-        if sink_handler is not None:
-            handler = sink_handler
-        response = await self._authorize(request, handler)
+        response = session_identity.refusal(request)
+        if response is None:
+            sink_handler = self._ws_sink_handler(request)
+            if sink_handler is not None:
+                handler = sink_handler
+            response = await self._authorize(request, handler)
         if response.status >= 400 and request.body_exists and request.can_read_body:
             response.force_close()
         return response
