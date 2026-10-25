@@ -48,7 +48,7 @@ import concurrent.futures
 from dataclasses import dataclass
 from aiohttp.web_ws import WebSocketResponse
 from aiohttp import web, WSMessage, WSMsgType
-from typing import Awaitable, Callable, Dict, Set, Optional, Any, Tuple, List
+from typing import Awaitable, Callable, Dict, FrozenSet, Set, Optional, Any, Tuple, List
 
 from .webrtc_utils import _is_trusted_config_file
 from .settings import settings as app_settings
@@ -85,6 +85,8 @@ class Peer:
             identifies ONE viewer across both transports, so a page moving from
             the sink to a peer connection hands its consumer entry over instead
             of registering a second one (ws_sink.WsSink.display_consumers).
+        scopes: What the relay granted this signaling connection, and so the
+            peer connection it negotiates (`connection_scopes`).
     """
 
     uid: str
@@ -99,6 +101,7 @@ class Peer:
     display_id: str = "primary"
     display_position: str = "right"
     session_peer_id: Optional[str] = None
+    scopes: Optional[FrozenSet[str]] = None
 
 
 class WebRTCPeerManagement:
@@ -655,7 +658,8 @@ class WebRTCPeerManagement:
         return "viewer"
 
     async def hello_peer(
-        self, ws: WebSocketResponse, raddr: str, auth_role_ceiling: Optional[str] = None
+        self, ws: WebSocketResponse, raddr: str, auth_role_ceiling: Optional[str] = None,
+        scopes: Optional[FrozenSet[str]] = None,
     ) -> Tuple[str, str, Optional[str], Optional[int], Optional[bool]]:
         """Exchange the HELLO handshake, validate, and register the peer.
 
@@ -687,6 +691,7 @@ class WebRTCPeerManagement:
             raddr: Remote address, for logging.
             auth_role_ceiling: Highest role the transport credential grants;
                 "viewer" caps a self-asserted controller.
+            scopes: The connection's scopes, kept on the peer.
 
         Returns:
             Tuple of (peer_id, peer_type, client_type, client_slot,
@@ -952,6 +957,7 @@ class WebRTCPeerManagement:
                     display_id=display_id,
                     display_position=display_position,
                     session_peer_id=session_peer_id,
+                    scopes=scopes,
                 )
                 result = (puid, peer_type, client_type, client_slot, client_strict_viewer)
         finally:
@@ -971,7 +977,8 @@ class WebRTCPeerManagement:
         return result
 
     async def signaling_handler(
-        self, ws: WebSocketResponse, raddr: str, auth_role_ceiling: Optional[str] = None
+        self, ws: WebSocketResponse, raddr: str, auth_role_ceiling: Optional[str] = None,
+        scopes: Optional[FrozenSet[str]] = None,
     ) -> None:
         """Serve one signaling connection end to end: handshake, message loop,
         and removal on disconnect.
@@ -982,6 +989,7 @@ class WebRTCPeerManagement:
             auth_role_ceiling: Highest role the transport-level credential
                 grants ("viewer" caps a self-asserted controller in legacy
                 basic-auth mode).
+            scopes: The connection's scopes (`connection_scopes`).
         """
         peer_id = None
         try:
@@ -991,7 +999,7 @@ class WebRTCPeerManagement:
                 client_type,
                 client_slot,
                 client_strict_viewer,
-            ) = await self.hello_peer(ws, raddr, auth_role_ceiling)
+            ) = await self.hello_peer(ws, raddr, auth_role_ceiling, scopes)
         except Exception as e:
             logger.error(f"Error during handshake with peer {raddr}: {e}")
             return

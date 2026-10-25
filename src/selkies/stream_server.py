@@ -54,6 +54,7 @@ except ImportError:
 
 from abc import ABCMeta, abstractmethod
 
+from . import connection_scopes
 from . import session_files
 from . import session_identity
 
@@ -1700,7 +1701,8 @@ class CentralizedStreamServer:
     ) -> web.StreamResponse:
         """Global auth guard for every route on the server: a request the proxy
         routed for another session is refused first (`session_identity`), then
-        ``_authorize`` decides.
+        ``_authorize`` decides, and the route it admits runs under the
+        connection's scopes (`connection_scopes`).
 
         A refusal is deliberately taken before the request's body is read -- an
         unauthenticated upload must not be paid for -- so the connection is closed
@@ -1713,6 +1715,8 @@ class CentralizedStreamServer:
             sink_handler = self._ws_sink_handler(request)
             if sink_handler is not None:
                 handler = sink_handler
+            handler = connection_scopes.guard(
+                request, handler, request.app["settings"].subfolder)
             response = await self._authorize(request, handler)
         if response.status >= 400 and request.body_exists and request.can_read_body:
             response.force_close()

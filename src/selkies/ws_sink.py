@@ -51,6 +51,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from aiohttp import WSMsgType, web
 
+from . import connection_scopes
 from .input_handler import (
     VIEWER_ALLOWED_PREFIXES,
     VIEWER_COLLAB_EXTRA_PREFIXES,
@@ -261,13 +262,15 @@ def dispatch_client_message(
     on_data_message: Callable[..., Any],
     input_denied: Callable[[str], bool],
     js_denied: Callable[[str], bool],
+    scopes: connection_scopes.Scopes = None,
     log: logging.Logger = logger,
 ) -> Any:
     """Filter one client message and hand it to the input dispatcher.
 
     The chain both transports share, in order: a gzip'd payload is inflated
     with a bound (the transport's own size limit caps only the compressed
-    size); the `_gz,1` handshake marks the connection for gzip'd sends and is
+    size); a message needing a scope the connection lacks is dropped
+    (`connection_scopes`); the `_gz,1` handshake marks the connection for gzip'd sends and is
     echoed; STOP_AUDIO/START_AUDIO pause this connection alone and are taken
     ahead of the viewer gate (audio is per consumer on both transports now, so
     a hidden viewer may mute itself); a viewer's SETTINGS snapshot is
@@ -288,6 +291,8 @@ def dispatch_client_message(
         except Exception:
             log.warning("Dropping undecodable compressed client message")
             return None
+    if connection_scopes.message_denied(msg, scopes):
+        return None
     if msg == "_gz,1":
         on_gz_handshake()
         return None
@@ -374,6 +379,7 @@ class WsClient:
         held_since: When the client's video was held for a full queue, else None.
         resyncing: Held video resumes on a keyframe; the deltas its relay drops
             until then are the hold's doing, not congestion.
+        scopes: What the relay granted this connection (`connection_scopes`).
     """
 
     __slots__ = ("conn_id", "ws", "role", "token", "slot", "remote_address",
@@ -382,13 +388,15 @@ class WsClient:
                  "last_ack", "gz", "closing", "clip_lock", "_next_idr",
                  "goodput_bps", "loss", "_last_bytes", "_last_tick",
                  "_last_backlog", "tick_rtt", "_rtt_floor", "held_since", "resyncing",
-                 "mic_notified", "cam_notified", "js_notified")
+                 "mic_notified", "cam_notified", "js_notified", "scopes")
 
     def __init__(self, conn_id: str, ws: web.WebSocketResponse, role: str,
                  token: Optional[str], slot: Optional[int],
                  remote_address: Tuple[Any, Any], session_peer_id: Optional[str],
-                 display_id: str = "primary") -> None:
+                 display_id: str = "primary",
+                 scopes: connection_scopes.Scopes = None) -> None:
         self.conn_id = conn_id
+        self.scopes = scopes
         self.ws = ws
         self.role = role
         self.token = token
@@ -1307,7 +1315,9 @@ class WsSink:
                               mime_type: str, reply_to: Optional[str]) -> None:
         """One payload at a time per client: the start/data/finish frames carry
         no transfer id, so two concurrent sends would interleave into one
-        assembly."""
+        assembly. A client without the clipboard scope is sent nothing."""
+        if not connection_scopes.allows(client.scopes, connection_scopes.CLIPBOARD):
+            return
         is_binary = mime_type != "text/plain"
         payload = data.encode("utf-8") if isinstance(data, str) else data
         async with client.clip_lock:
@@ -1462,7 +1472,8 @@ class WsSink:
             await self.run_client(ws, remote_address, token,
                                   query_role=query_role, query_slot=query_slot,
                                   session_peer_id=_session_id(
-                                      request.query.get("session_peer_id")))
+                                      request.query.get("session_peer_id")),
+                                  scopes=request.get(connection_scopes.REQUEST_KEY))
         finally:
             if handler_task is not None:
                 self._handlers.discard(handler_task)
@@ -1473,7 +1484,8 @@ class WsSink:
     async def run_client(self, ws: web.WebSocketResponse, remote_address: Tuple[Any, Any],
                          token: str = "", query_role: str = "",
                          query_slot: Optional[str] = None,
-                         session_peer_id: Optional[str] = None) -> None:
+                         session_peer_id: Optional[str] = None,
+                         scopes: connection_scopes.Scopes = None) -> None:
         """Run one sink connection from handshake to cleanup.
 
         The handshake is the websockets service's, in its order: AUTH_SUCCESS
@@ -1517,7 +1529,7 @@ class WsSink:
 
         self._conn_seq += 1
         client = WsClient(f"wssink:{self._conn_seq}", ws, role, token or None, slot,
-                          remote_address, session_peer_id)
+                          remote_address, session_peer_id, scopes=scopes)
         logger.info("Sink client %s connected from %s (role %s).",
                     client.conn_id, remote_address, role)
         try:
@@ -1676,6 +1688,7 @@ class WsSink:
             on_data_message=self._on_data_message,
             input_denied=lambda m: secure_input_denied(m, client.token, logger),
             js_denied=lambda m: gamepad_denied(m, client.role, client.token, client.slot),
+            scopes=client.scopes,
             log=logger,
         )
         if asyncio.iscoroutine(result):

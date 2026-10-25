@@ -47,6 +47,7 @@ import argparse
 from aiohttp import web
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
+from . import connection_scopes
 from .rtc import IDR_REQUEST_FLOOR_S, RTCApp, ClientType
 from . import selkies as selkies_module
 from .selkies import current_session_tokens, SCALING_DPI_MIN, SCALING_DPI_MAX
@@ -502,6 +503,7 @@ class WebRTCService(BaseStreamingService):
         # the claim is this process, and the relay's fields are positional.
         peer = self.peer_manager.peers.get(session_peer_id) if self.peer_manager else None
         client_slot = getattr(peer, "client_slot", None) if peer else None
+        scopes = getattr(peer, "scopes", None) if peer else None
         logger.info(
             f"starting session for client peer id: {session_peer_id} of type: {client_type} (display '{display_id}')"
         )
@@ -522,7 +524,8 @@ class WebRTCService(BaseStreamingService):
                 entry["position"] = display_position
                 self._seed_display_settings(entry)
             await self.rtc_app.start_rtc_connection(
-                session_peer_id, client_type, client_token, display_id, client_slot)
+                session_peer_id, client_type, client_token, display_id, client_slot,
+                scopes)
             if self.args.enable_webrtc_statistics and self.metrics:
                 await self.metrics.initialize_webrtc_csv_file(self.args.webrtc_statistics_dir)
             logger.info(f"started session for client peer id {session_peer_id}")
@@ -3096,7 +3099,8 @@ class WebRTCService(BaseStreamingService):
         peername = request.transport.get_extra_info("peername")
         remote_address = peername if peername else (request.remote, 0)
         await self.peer_manager.signaling_handler(
-            ws, remote_address, auth_role_ceiling=request.get("auth_role_ceiling")
+            ws, remote_address, auth_role_ceiling=request.get("auth_role_ceiling"),
+            scopes=request.get(connection_scopes.REQUEST_KEY),
         )
         return ws
 

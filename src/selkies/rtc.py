@@ -97,6 +97,7 @@ from .input_handler import (
     VIEWER_COLLAB_EXTRA_PREFIXES,
     VIEWER_SILENT_DROP_PREFIXES,
 )
+from . import connection_scopes
 from .input_queue import InputQueue, Overflow, RELEASE_MESSAGES
 from .selkies import current_session_tokens
 from .ws_sink import (dispatch_client_message, gamepad_denied,
@@ -688,13 +689,16 @@ class RTCApp:
             channel = peer_obj.get("data_channel") if peer_obj else None
             if channel is None or channel.readyState != "open":
                 return
+            if not connection_scopes.allows(peer_obj.get("scopes"), connection_scopes.CLIPBOARD):
+                return
             requester = channel
 
         def send_typed(msg_type: str, payload: Any) -> None:
             if requester is not None:
                 self.send_message_to_channel(requester, msg_type, payload)
             else:
-                self.__send_data_channel_message(msg_type, payload)
+                self.__send_data_channel_message(msg_type, payload,
+                                                 scope=connection_scopes.CLIPBOARD)
 
         if len(data_bytes) <= clipboard_chunk_size:
             b64data = base64.b64encode(data_bytes).decode('utf-8')
@@ -716,7 +720,7 @@ class RTCApp:
             if reply_to:
                 start_payload["reply_to"] = reply_to
             channels = ([requester] if requester is not None
-                        else list(self._iter_open_data_channels()))
+                        else list(self._iter_open_data_channels(connection_scopes.CLIPBOARD)))
             # One payload at a time per channel: start/data/end carry no
             # transfer id, so a send racing another would interleave two
             # payloads' chunks into one assembly.
@@ -917,9 +921,10 @@ class RTCApp:
         data_channel_state = peer_obj.get("data_channel").readyState
         return conn_state == "connected" and data_channel_state == "open", peer_obj.get("data_channel")
 
-    def _iter_open_data_channels(self) -> Iterator[RTCDataChannel]:
+    def _iter_open_data_channels(self, scope: Optional[str] = None) -> Iterator[RTCDataChannel]:
         """Yield every connected peer's open data channel - controllers and
-        viewers, all displays."""
+        viewers, all displays - or, given a scope, those of the peers holding
+        it (`connection_scopes`)."""
         for peer_obj in self.peer_connections.values():
             peer_conn = peer_obj.get("peer_conn")
             channel = peer_obj.get("data_channel")
@@ -928,6 +933,8 @@ class RTCApp:
                 and channel is not None
                 and peer_conn.connectionState == "connected"
                 and channel.readyState == "open"
+                and (scope is None
+                     or connection_scopes.allows(peer_obj.get("scopes"), scope))
             ):
                 yield channel
 
@@ -968,13 +975,14 @@ class RTCApp:
         except InvalidStateError:
             logger.info("skipping message because data channel closed mid-send: %s" % msg_type)
 
-    def __send_data_channel_message(self, msg_type: str, data: Any) -> None:
+    def __send_data_channel_message(self, msg_type: str, data: Any,
+                                    scope: Optional[str] = None) -> None:
         """Broadcast a typed message to every connected peer.
 
         All display controllers and viewers receive it - the websockets
         transport broadcasts cursor, stats, and clipboard to all of its
         clients, so the channel path must too. Channels that are not open are
-        skipped.
+        skipped, and so are the peers without `scope` when one is given.
         """
         if msg_type == "system" and self.on_ws_system is not None:
             # Before the no-peer return: a session with sink clients only still
@@ -983,7 +991,7 @@ class RTCApp:
         if not self.peer_connections:
             return
         sent = False
-        for channel in self._iter_open_data_channels():
+        for channel in self._iter_open_data_channels(scope):
             self.send_message_to_channel(channel, msg_type, data)
             sent = True
         if not sent:
@@ -1621,7 +1629,8 @@ class RTCApp:
                                   client_token: Optional[str] = None,
                                   display_id: str = "primary",
                                   peer_id: Optional[str] = None,
-                                  client_slot: Optional[int] = None) -> Any:
+                                  client_slot: Optional[int] = None,
+                                  scopes: connection_scopes.Scopes = None) -> Any:
         """Pre-filter one data-channel message before the input dispatcher.
 
         In order: a gzip'd payload is inflated with a bound (the channel's
@@ -1686,6 +1695,7 @@ class RTCApp:
             input_denied=lambda m: self._secure_input_denied(m, client_token),
             js_denied=lambda m: self._gamepad_denied(m, client_type, client_token,
                                                      client_slot),
+            scopes=scopes,
             log=logger,
         )
 
@@ -1790,6 +1800,7 @@ class RTCApp:
         client_token: Optional[str] = None,
         display_id: str = "primary",
         client_slot: Optional[int] = None,
+        scopes: connection_scopes.Scopes = None,
     ) -> None:
         """Create a peer connection and send its offer over signaling.
 
@@ -1890,7 +1901,7 @@ class RTCApp:
         data_channel.on("error", lambda e=None: self.on_data_error(e))
         input_consumer = self._serialize_channel(
             data_channel,
-            lambda msg, ch=data_channel, ct=client_type, tok=client_token, did=display_id, pid=client_peer_id, slot=client_slot: self._on_input_channel_message(msg, ch, ct, tok, did, pid, slot),
+            lambda msg, ch=data_channel, ct=client_type, tok=client_token, did=display_id, pid=client_peer_id, slot=client_slot, sc=scopes: self._on_input_channel_message(msg, ch, ct, tok, did, pid, slot, sc),
         )
 
         peer_connection.on("connectionstatechange", lambda cid=client_peer_id: asyncio.run_coroutine_threadsafe(self.on_connectionstatechange(cid), loop=self.async_event_loop))
@@ -1947,6 +1958,7 @@ class RTCApp:
             "audio_sender": rtp_audio_sender,
             "audio_paused": audio_paused,
             "client_token": client_token,
+            "scopes": scopes,
         }
         await self._notify_consumers_changed(display_id)
 
@@ -2329,7 +2341,7 @@ class RTCApp:
             except Exception as e:
                 logger.debug(f"Error closing orphaned viewer '{pid}': {e}")
 
-    async def start_rtc_connection(self, client_peer_id: str, client_type: str, client_token: Optional[str] = None, display_id: str = "primary", client_slot: Optional[int] = None) -> None:
+    async def start_rtc_connection(self, client_peer_id: str, client_type: str, client_token: Optional[str] = None, display_id: str = "primary", client_slot: Optional[int] = None, scopes: connection_scopes.Scopes = None) -> None:
         """Start a peer connection, cleaning up the half-built state on failure.
 
         A signaling socket that dies mid-handshake (refresh/eviction race) is
@@ -2337,7 +2349,7 @@ class RTCApp:
         """
         try:
             logger.info("Starting RTC pipeline", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
-            await self._start_rtc_pipeline(client_peer_id, client_type, client_token, display_id, client_slot)
+            await self._start_rtc_pipeline(client_peer_id, client_type, client_token, display_id, client_slot, scopes)
         except (aiohttp.ClientConnectionResetError, ConnectionResetError) as e:
             logger.info(f"Peer went away during RTC setup: {e}", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
             await self._cleanup_failed_start(client_peer_id, client_type, display_id)

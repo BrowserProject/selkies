@@ -17,3 +17,4 @@ signaling_keepalive_test.py
 ice_consent_test.py
 peer_closed_signal_test.py
 rtc_config_monitor_test.py
+connection_scopes_test.py

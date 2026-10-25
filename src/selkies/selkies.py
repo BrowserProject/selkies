@@ -64,6 +64,7 @@ import psutil
 from aiohttp import web, WSMsgType
 
 from . import audio_config
+from . import connection_scopes
 from . import gpu_stats
 from .audio_control import AudioControl, ensure_capture_sink
 from .display_utils import (
@@ -973,7 +974,10 @@ class SelkiesStreamingApp:
                     await _broadcast_to_clients(clients, "clipboard_finish",
                                                 per_client_timeout=2.0, only=cid)
 
-            recipients = [c for c in list(clients) if conn_id is None or id(c) == conn_id]
+            recipients = [c for c in list(clients) if (conn_id is None or id(c) == conn_id)
+                          and connection_scopes.allows(
+                              (client_permissions.get(c) or {}).get("scopes"),
+                              connection_scopes.CLIPBOARD)]
             await asyncio.gather(*(deliver(c) for c in recipients))
             if not small:
                 data_logger.info("Finished sending multi-part clipboard data.")
@@ -3195,6 +3199,7 @@ class DataStreamingServer(BaseStreamingService):
         token: str = "",
         query_role: str = "",
         query_slot: Optional[str] = None,
+        scopes: connection_scopes.Scopes = None,
     ) -> None:
         """Run one data-WebSocket connection from handshake to cleanup.
 
@@ -3223,6 +3228,7 @@ class DataStreamingServer(BaseStreamingService):
             token: Auth token (secure mode only).
             query_role: Legacy-mode role request ("viewer" caps the role).
             query_slot: Legacy-mode gamepad slot request ("2".."4").
+            scopes: The connection's scopes (`connection_scopes`).
         """
         if self.is_secure_mode:
             await self.config_gate.wait()
@@ -3238,6 +3244,7 @@ class DataStreamingServer(BaseStreamingService):
                 "slot": permissions.get("slot"),
                 "remote_address": remote_address,
                 "data_server": self,
+                "scopes": scopes,
             }
             data_logger.info(f"Client {remote_address} authenticated with token. Role: {permissions.get('role')}, Slot: {permissions.get('slot')}")
             auth_success_payload = json.dumps({
@@ -3272,7 +3279,8 @@ class DataStreamingServer(BaseStreamingService):
                 except (ConnectionResetError, OSError, RuntimeError):
                     pass
                 return
-            client_permissions[websocket] = {"token": None, "role": role, "slot": slot, "remote_address": remote_address}
+            client_permissions[websocket] = {"token": None, "role": role, "slot": slot,
+                                             "remote_address": remote_address, "scopes": scopes}
             data_logger.info(f"Legacy client {remote_address} connected. Role: {role}, Slot: {slot}")
 
         global TARGET_FRAMERATE
@@ -3617,6 +3625,8 @@ class DataStreamingServer(BaseStreamingService):
                             pass
                         continue
                     perms = client_permissions.get(websocket)
+                    if connection_scopes.message_denied(message, (perms or {}).get("scopes")):
+                        continue
                     if perms and perms.get("role") == "viewer":
                         # Authority lists shared with the WebRTC gate: the collab extras
                         # need enable_collab on, even for a viewer holding the mk token.
@@ -5990,7 +6000,8 @@ class DataStreamingServer(BaseStreamingService):
             query_role = "viewer"
             query_slot = None
         try:
-            await self.ws_handler(ws, remote_address, token, query_role=query_role, query_slot=query_slot)
+            await self.ws_handler(ws, remote_address, token, query_role=query_role, query_slot=query_slot,
+                                  scopes=request.get(connection_scopes.REQUEST_KEY))
         finally:
             try:
                 self._report_client_presence()
