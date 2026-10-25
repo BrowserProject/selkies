@@ -1702,10 +1702,38 @@ class CentralizedStreamServer:
         server parse them as the next request's method, which fails that request
         and every later one on the same connection.
         """
+        sink_handler = self._ws_sink_handler(request)
+        if sink_handler is not None:
+            handler = sink_handler
         response = await self._authorize(request, handler)
         if response.status >= 400 and request.body_exists and request.can_read_body:
             response.force_close()
         return response
+
+    def _ws_sink_handler(
+        self, request: web.Request
+    ) -> Optional[Callable[[web.Request], Awaitable[web.StreamResponse]]]:
+        """The WebSocket sink's handler for `/api/websockets`, or None.
+
+        Both services register routes on one router, and the websockets service
+        owns that path; a second registration for it would be refused outright.
+        The sink therefore takes the path here, ahead of the routing table but
+        BEHIND every gate in `_authorize` (the Origin rule for upgrades, the
+        session-token verdict and its viewer ceiling), so a sink connection is
+        authorized exactly like the websockets one it stands in for.
+
+        Only while the WebRTC service is the active mode and its sink is
+        active: in websockets mode the routing table's own handler answers and
+        the path behaves as it always did.
+        """
+        settings = request.app["settings"]
+        if request.path.rstrip("/") != f"{settings.subfolder}/api/websockets":
+            return None
+        service = self.services.get("webrtc")
+        sink = getattr(service, "ws_sink", None) if service is not None else None
+        if sink is None or self.current_mode != "webrtc":
+            return None
+        return sink.handle_request
 
     async def _authorize(
         self,
@@ -1991,12 +2019,20 @@ class CentralizedStreamServer:
         session that never comes up would otherwise strand the user with no
         way back to WebSockets.
         """
+        webrtc = self.services.get("webrtc")
+        sink = getattr(webrtc, "ws_sink", None) if webrtc is not None else None
+        sink_live = sink is not None and self.current_mode == "webrtc"
         return {
             "current_mode": self.current_mode,
             "available_modes": list(self.services.keys()),
             "enable_dual_mode": bool(
                 getattr(self.settings, "enable_dual_mode", (False,))[0]
             ),
+            # The WebSocket sink: with it, a viewer that cannot reach WebRTC
+            # opens /api/websockets on THIS service instead of asking for a
+            # mode switch, so the switch choreography is never entered.
+            "ws_sink": bool(sink_live),
+            "ws_clients": sink.client_count() if sink_live else 0,
         }
 
     @staticmethod
@@ -2021,12 +2057,22 @@ class CentralizedStreamServer:
         refused here, and the master token remains the operator's way in for a
         deployment that hands out tokens it does not want switching for
         everyone (the switch restarts the service under every connected page).
-        Refused as well when dual mode is disabled.
+        Refused as well when dual mode is disabled, and with 409
+        `ws_sink_active` on a WebRTC service whose WebSocket sink is enabled:
+        that service already serves both wire formats, so a switch would only
+        drop the viewers who did not ask for one.
         """
         switch_token = os.environ.get("SELKIES_SWITCH_TOKEN", "")
         presented = request.headers.get("X-Selkies-Switch-Token", "")
         if not switch_token or not hmac.compare_digest(presented.encode(), switch_token.encode()):
             return web.json_response({"status": "error", "message": "Forbidden switch"}, status=403)
+        webrtc = getattr(self, "services", {}).get("webrtc")
+        if (getattr(webrtc, "ws_sink", None) is not None
+                and self.current_mode == "webrtc"):
+            # Nothing to switch to: this service already serves both wire
+            # formats, and tearing it down would drop every other viewer.
+            return web.json_response({"error": "ws_sink_active"}, status=409)
+
         if self._viewer_ceiling(request):
             return web.json_response(
                 {"status": "error", "message": "View-only credentials cannot switch streaming mode"},

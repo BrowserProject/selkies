@@ -14,7 +14,8 @@ cannot trade the session forever.
 
 Wire protocol (text frames, space-separated): a peer opens with
 `HELLO <server|client> [<json-metadata>]` (`client_type`, `client_slot`,
-`client_strict_viewer`, `client_token`, `server_token`, `display_id`,
+`client_strict_viewer`, `client_token`, `server_token`, `session_peer_id`,
+`display_id`,
 `display_position`) and is answered `HELLO`. `SESSION <peer-id|server>` pairs
 the caller with the callee: the caller gets `SESSION_OK <callee-id>`, the callee
 `SESSION_START <caller-id> <client_type> <display_id> <display_position>
@@ -79,6 +80,11 @@ class Peer:
         display_position: Where a secondary display sits relative to the
             primary ("right"/"left"/"up"/"down"), carried to the server side
             so it lays the framebuffer out like websockets mode.
+        session_peer_id: The viewer page's own session id (`vp-...`), the same
+            value it presents on the WebSocket sink's `?session_peer_id=`. It
+            identifies ONE viewer across both transports, so a page moving from
+            the sink to a peer connection hands its consumer entry over instead
+            of registering a second one (ws_sink.WsSink.display_consumers).
     """
 
     uid: str
@@ -92,6 +98,7 @@ class Peer:
     peer_status: Optional[str] = None
     display_id: str = "primary"
     display_position: str = "right"
+    session_peer_id: Optional[str] = None
 
 
 class WebRTCPeerManagement:
@@ -708,6 +715,7 @@ class WebRTCPeerManagement:
         client_strict_viewer = None
         client_token = None
         server_token = None
+        session_peer_id = None
         display_id = "primary"
         display_position = "right"
         dead_peer_notifications: List[Callable[[], Awaitable[Any]]] = []
@@ -741,6 +749,9 @@ class WebRTCPeerManagement:
                         client_strict_viewer = json_metadata.get("client_strict_viewer")
                         client_token = json_metadata.get("client_token")
                         server_token = json_metadata.get("server_token")
+                        raw_session_peer_id = json_metadata.get("session_peer_id")
+                        session_peer_id = (str(raw_session_peer_id)[:128]
+                                           if raw_session_peer_id else None)
                         display_id = json_metadata.get("display_id") or "primary"
                         pos = json_metadata.get("display_position")
                         display_position = pos if pos in ("right", "left", "up", "down") else "right"
@@ -939,6 +950,7 @@ class WebRTCPeerManagement:
                     client_token=client_token,
                     display_id=display_id,
                     display_position=display_position,
+                    session_peer_id=session_peer_id,
                 )
                 result = (puid, peer_type, client_type, client_slot, client_strict_viewer)
         finally:

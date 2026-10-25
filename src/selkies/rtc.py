@@ -86,7 +86,7 @@ from .webrtc.exceptions import InvalidStateError
 from fractions import Fraction
 
 from .webrtc.codecs.base import EncodedPacket
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple, Union
 from .webrtc.contrib.relay import MediaRelay
 from enum import Enum
 from .media_pipeline import MediaPipeline
@@ -98,6 +98,8 @@ from .input_handler import (
     VIEWER_SILENT_DROP_PREFIXES,
 )
 from .selkies import current_session_tokens
+from .ws_sink import (dispatch_client_message, gamepad_denied,
+                      secure_input_denied, viewer_is_collaborator)
 
 
 def parse_webrtc_port_range(raw: str) -> Optional[Tuple[int, int]]:
@@ -473,6 +475,14 @@ class RTCApp:
         self.ice_tcp_mux: Optional[TcpMux] = None
         self.encoder = encoder
         self.last_cursor_sent = None
+        # Set by the WebSocket sink: clipboard payloads must also reach the
+        # sink's clients, and one addressed at a sink client belongs to it
+        # alone (the peers already hold the content).
+        self.on_ws_clipboard: Optional[Callable[..., Awaitable[bool]]] = None
+        # Set by the WebSocket sink: `system` actions and realized resolutions
+        # must reach its clients too, in the websockets spelling.
+        self.on_ws_system: Optional[Callable[[str, Any], bool]] = None
+        self.on_ws_resolution: Optional[Callable[[int, int, str], None]] = None
 
         self.displays: Dict[str, Dict[str, Any]] = {}
         self.media_pipeline: Optional[MediaPipeline] = None
@@ -622,6 +632,11 @@ class RTCApp:
         if not data and not reply_to:
             return
 
+        if self.on_ws_clipboard is not None and await self.on_ws_clipboard(
+                data, mime_type, reply_to, peer_id):
+            # Answered a sink client's own fetch; the peers asked for nothing.
+            return
+
         is_text = mime_type == "text/plain"
         data_bytes: bytes = data.encode() if isinstance(data, str) else data
         clipboard_chunk_size = get_adjusted_chunk_size(self.peer_connections)
@@ -742,6 +757,9 @@ class RTCApp:
         broadcast, and shared-mode viewers suppress it client-side.
         """
         if peer_id is not None:
+            if self.on_ws_system is not None and self.on_ws_system(action, peer_id):
+                # The requester is a sink client; it was served there.
+                return
             peer_obj = self.peer_connections.get(peer_id)
             channel = peer_obj.get("data_channel") if peer_obj else None
             if channel is not None and channel.readyState == "open":
@@ -787,6 +805,14 @@ class RTCApp:
         realized size must never rescale the primary page.
         """
         logger.info("sending remote resolution of: " + res)
+        if self.on_ws_resolution is not None:
+            # The sink's clients want the websockets `stream_resolution`
+            # message; the `resolution,WxH` system action means nothing to them.
+            try:
+                width, height = (int(v) for v in res.lower().split("x", 1))
+                self.on_ws_resolution(width, height, display_id or "primary")
+            except (TypeError, ValueError):
+                logger.warning("Not forwarding an unparseable resolution: %r", res)
         sent = False
         for peer_obj in self.peer_connections.values():
             if (peer_obj.get("display_id") or "primary") != display_id:
@@ -908,6 +934,10 @@ class RTCApp:
         clients, so the channel path must too. Channels that are not open are
         skipped.
         """
+        if msg_type == "system" and self.on_ws_system is not None:
+            # Before the no-peer return: a session with sink clients only still
+            # has clients to tell.
+            self.on_ws_system(str((data or {}).get("action", "")), None)
         if not self.peer_connections:
             return
         sent = False
@@ -1486,15 +1516,10 @@ class RTCApp:
 
     def _viewer_is_collaborator(self, client_token: Optional[str]) -> bool:
         """A viewer holding the active mk (mouse+keyboard) token is a read-write
-        collaborator - mirrors the WS mk-token path - but only while enable_collab
-        is on. Fail-safe: any missing piece means not a collaborator (stays
-        read-only)."""
-        if not client_token:
-            return False
-        if not bool(app_settings.enable_collab[0]):
-            return False
-        _, mk = current_session_tokens()
-        return mk is not None and client_token == mk
+        collaborator, but only while enable_collab is on. The rule itself is
+        shared with the WebSocket sink (ws_sink), so neither transport can
+        drift from it."""
+        return viewer_is_collaborator(client_token)
 
     def _mk_input_authorized(self, client_token: Optional[str]) -> bool:
         """Token-level input authority in secure mode: the active mk-token holder,
@@ -1522,61 +1547,29 @@ class RTCApp:
         return self._mk_input_authorized(client_token)
 
     def _secure_input_denied(self, msg: str, client_token: Optional[str]) -> bool:
-        """Secure-mode (master token configured) input authority, mirroring the WS
-        gate: cmd and the keyboard/mouse/clipboard set are admitted only from the
-        active mk-token holder, or from a controller-role token when no mk-token is
-        provisioned. client_type is self-asserted over signaling, so a peer that
-        merely claims 'controller' is still held to the token here. `co`
-        (composed-text typing, `co,end,<text>`) is keyboard input like kd/ku.
-        The bare `cr` clipboard read-back is exempt like every clipboard read
-        on the websockets transport: the handler itself direction-gates it
-        (enable_clipboard "out") and it is sent at connect, before the peer
-        can hold input authority.
+        """Secure-mode (master token configured) input authority; the rule lives
+        in ws_sink so both transports gate identically.
 
         Returns:
             True when the message must be dropped.
         """
-        if not app_settings.master_token:
-            return False
-        if msg.split(",", 1)[0] in ("cr",):
-            return False
-        if msg.split(",", 1)[0] not in ("cmd", "co") and not msg.startswith(VIEWER_COLLAB_EXTRA_PREFIXES):
-            return False
-        authorized = self._mk_input_authorized(client_token)
-        if not authorized:
-            logger.warning("Dropping unauthorized secure-mode input: %s", msg[:32])
-        return not authorized
+        return secure_input_denied(msg, client_token, logger)
 
     def _gamepad_denied(self, msg: str, client_type: Optional[ClientType],
                         client_token: Optional[str],
                         client_slot: Optional[int]) -> bool:
-        """Gamepad slot authority, mirroring the WS gate: a client may only drive
-        the slot it holds, so a viewer or collaborator can't spoof another
-        player's controller.
+        """Gamepad slot authority (shared with the sink, see ws_sink).
 
-        Under a master token the slot comes from the live token store, so a
-        revocation or re-slot lands on the next message; otherwise from the
-        peer's HELLO claim, which the signaling server validated (`-1` is its
-        unassigned sentinel). A legacy controller's claim of slot 1 is registry
-        identity rather than a gamepad restriction - the websockets handshake
-        gives it no slot at all - and is dropped, so the same client in the
-        same role is governed the same on both transports.
+        A legacy controller's claim of slot 1 is registry identity rather than
+        a gamepad restriction - the websockets handshake gives it no slot at
+        all - so the role is resolved here and the slot claim only reaches the
+        shared rule for a viewer.
 
         Returns:
             True when the gamepad message must be dropped.
         """
-        if not msg.startswith("js,"):
-            return False
         role = "controller" if client_type is ClientType.CONTROLLER else "viewer"
-        if app_settings.master_token:
-            tokens, _ = current_session_tokens()
-            perms = tokens.get(client_token) if client_token else None
-            slot = perms.get("slot") if perms else None
-        elif role == "viewer":
-            slot = client_slot if (client_slot or 0) > 0 else None
-        else:
-            slot = None
-        return gamepad_slot_denied(msg, role, slot, bool(app_settings.master_token))
+        return gamepad_denied(msg, role, client_token, client_slot)
 
     def _on_input_channel_message(self, msg: Any,
                                   channel: Optional[RTCDataChannel] = None,
@@ -1613,46 +1606,30 @@ class RTCApp:
             which the channel's queue consumer awaits), or None when the
             message was consumed or dropped here.
         """
-        if isinstance(msg, (bytes, bytearray)) and bytes(msg[:2]) == b"\x1f\x8b":
+        def _gz_ack() -> None:
+            if channel is None:
+                return
+            channel._selkies_gz_tx = True
             try:
-                msg = inflate_gz_bounded(msg)
-            except Exception:
-                logger.warning("Dropping undecodable compressed data channel message")
-                return
-        if msg == "_gz,1":
-            if channel is not None:
-                channel._selkies_gz_tx = True
-                try:
-                    channel.send("_gz,1")
-                except Exception as e:
-                    logger.warning("Failed to ack compression handshake: %s", e)
-            return
-        if msg in ("STOP_AUDIO", "START_AUDIO"):
-            # Per peer, so ahead of the viewer gate: the websockets verb is
-            # global and refused to viewers, this one pauses only the sender.
-            if self.on_audio_consumer_active is not None:
-                return self.on_audio_consumer_active(peer_id, msg == "START_AUDIO")
-            return
-        if client_type == ClientType.VIEWER and isinstance(msg, str) and msg.startswith("SETTINGS,"):
-            logger.debug("Ignoring SETTINGS payload from a viewer (display '%s')", display_id)
-            return
-        if client_type == ClientType.VIEWER and isinstance(msg, str):
-            if not msg.startswith(VIEWER_ALLOWED_PREFIXES) and not (
-                msg.startswith(VIEWER_COLLAB_EXTRA_PREFIXES)
-                and self._viewer_is_collaborator(client_token)
-            ):
-                if not msg.startswith(VIEWER_SILENT_DROP_PREFIXES):
-                    logger.warning("Dropping unauthorized viewer input: %s", msg[:32])
-                return
-        if isinstance(msg, str) and self._secure_input_denied(msg, client_token):
-            return
-        if isinstance(msg, str) and self._gamepad_denied(msg, client_type, client_token, client_slot):
-            logger.warning("Dropping gamepad input for a slot this peer does not hold: %s", msg[:32])
-            return
-        if msg in ("STOP_VIDEO", "START_VIDEO") and self.on_video_consumer_active is not None:
-            return self.on_video_consumer_active(
-                peer_id, display_id or "primary", msg == "START_VIDEO")
-        return self.on_data_message(msg, display_id or "primary", conn_id=peer_id)
+                channel.send("_gz,1")
+            except Exception as e:
+                logger.warning("Failed to ack compression handshake: %s", e)
+
+        return dispatch_client_message(
+            msg,
+            is_viewer=client_type == ClientType.VIEWER,
+            is_collaborator=lambda: self._viewer_is_collaborator(client_token),
+            display_id=display_id,
+            conn_id=peer_id,
+            on_gz_handshake=_gz_ack,
+            on_audio_consumer_active=self.on_audio_consumer_active,
+            on_video_consumer_active=self.on_video_consumer_active,
+            on_data_message=self.on_data_message,
+            input_denied=lambda m: self._secure_input_denied(m, client_token),
+            js_denied=lambda m: self._gamepad_denied(m, client_type, client_token,
+                                                     client_slot),
+            log=logger,
+        )
 
     async def on_peer_connection_established(self, client_peer_id: str, client_type: ClientType, display_id: str = "primary") -> None:
         """Start the display's capture when a peer finishes connecting.

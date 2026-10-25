@@ -650,6 +650,14 @@ class _VideoRelay:
     costs a repaint request. A fresh relay starts fully gated, so a joining
     client waits for a keyframe instead of decoding mid-GOP garbage.
 
+    The host is a narrow protocol, not this service: `display_clients` (the
+    per-display ack/RTT state a stamped send updates), `clients` (the socket
+    registry a dead socket is discarded from), `video_relay_groups` (the group
+    the finished task removes itself from) and `_bytes_sent_in_interval`. The
+    websockets service satisfies it; so does the WebRTC service's WebSocket
+    sink (`ws_sink._RelayHost`), which is why both transports run this one
+    bounded relay rather than two implementations of it.
+
     Attributes:
         budget: Skip-ahead byte bound for the backlog (`_video_relay_budget`).
         backlog: Undrained fan-out items, oldest first.
@@ -659,16 +667,23 @@ class _VideoRelay:
         stopped: Set by `stop`; the drain task exits after its in-flight send.
     """
 
-    __slots__ = ('server', 'display_id', 'ws', 'budget', 'backlog',
+    __slots__ = ('host', 'display_id', 'ws', 'budget', 'backlog',
                  'backlog_bytes', 'live_rows', 'stopped', '_wake', '_task',
-                 '_next_sync_req')
+                 '_next_sync_req', 'send_timeout')
 
-    def __init__(self, server: "DataStreamingServer", display_id: str,
-                 ws: web.WebSocketResponse, budget: int) -> None:
-        self.server = server
+    def __init__(self, host: Any, display_id: str,
+                 ws: web.WebSocketResponse, budget: int,
+                 send_timeout: float = SHARED_STREAM_SEND_TIMEOUT_SECONDS) -> None:
+        self.host = host
         self.display_id = display_id
         self.ws = ws
         self.budget = budget
+        # How long one send may take before the client is given up on. The
+        # websockets service keeps its own second; the WebSocket sink allows
+        # more, because there a stalled send is the signal that steers the
+        # shared encoder down (ws_sink.SINK_SEND_STALL_S) and dropping the
+        # client would end the session instead of slowing it.
+        self.send_timeout = float(send_timeout)
         self.backlog: deque = deque()
         self.backlog_bytes = 0
         self.live_rows: set[int] = set()
@@ -759,7 +774,7 @@ class _VideoRelay:
                 self.backlog_bytes -= len(data)
                 # Stamped before the await, and only for the display's
                 # registered client: that is what the ACK RTT math measures.
-                ds = self.server.display_clients.get(self.display_id)
+                ds = self.host.display_clients.get(self.display_id)
                 if ds is not None and ds.get('ws') is self.ws:
                     fid = item['frame_id']
                     now = time.monotonic()
@@ -773,22 +788,22 @@ class _VideoRelay:
                 try:
                     await asyncio.wait_for(
                         self.ws.send_bytes(data),
-                        timeout=SHARED_STREAM_SEND_TIMEOUT_SECONDS,
+                        timeout=self.send_timeout,
                     )
                 except asyncio.TimeoutError:
                     # Checked before OSError: on 3.11+ TimeoutError subclasses it.
                     data_logger.warning(
                         f"Video relay for '{self.display_id}' send stalled past "
-                        f"{SHARED_STREAM_SEND_TIMEOUT_SECONDS}s; dropping client.")
-                    self.server.clients.discard(self.ws)
+                        f"{self.send_timeout}s; dropping client.")
+                    self.host.clients.discard(self.ws)
                     _close_abandoned_ws(self.ws)
                     return
                 except (ConnectionResetError, OSError, RuntimeError):
-                    self.server.clients.discard(self.ws)
+                    self.host.clients.discard(self.ws)
                     return
-                self.server._bytes_sent_in_interval += len(data)
+                self.host._bytes_sent_in_interval += len(data)
         finally:
-            group = self.server.video_relay_groups.get(self.display_id)
+            group = self.host.video_relay_groups.get(self.display_id)
             if group is not None and group.get(self.ws) is self:
                 del group[self.ws]
 

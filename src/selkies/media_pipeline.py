@@ -234,6 +234,12 @@ class MediaPipelinePixel(MediaPipeline):
         )
         self.on_pipeline_started: Callable[[], None] = lambda: None
         self.on_cursor_data: Callable[[dict], None] = lambda data: None
+        # WebSocket sink taps (ws_sink.WsSink), set only while a sink client is
+        # connected: the RAW frame, header included, which is already the
+        # websockets wire format. None means no sink, and the capture callbacks
+        # are then exactly what they were.
+        self.on_ws_frame: Optional[Callable[[Any], None]] = None
+        self.on_ws_audio: Optional[Callable[[Any], None]] = None
         self.get_cursor_size_cap: Callable[[], int] = lambda: 0
 
         self.capture_module: Any = None
@@ -541,6 +547,12 @@ class MediaPipelinePixel(MediaPipeline):
         with no per-frame Future, matching the websockets path.
         """
         try:
+            # The sink wants the frame BEFORE the header is cut: pixelflux's
+            # stripe header is the websockets wire format. One reference hand-off
+            # per frame, no copy and no second encode.
+            ws_sink = self.on_ws_frame
+            if ws_sink is not None:
+                ws_sink(frame)
             view = memoryview(frame)
             if len(view) > STRIPE_HEADER_LEN:
                 keyframe = view[0] != 0x04 or view[1] == 0x01
@@ -793,6 +805,9 @@ class MediaPipelinePixel(MediaPipeline):
                 a glitch.
                 """
                 try:
+                    ws_sink = self.on_ws_audio
+                    if ws_sink is not None:
+                        ws_sink(frame)
                     if len(frame) > 0:
                         data_bytes = memoryview(frame)
                         raw_pts = int(frame.pts)

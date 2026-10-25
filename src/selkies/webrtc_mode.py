@@ -64,6 +64,7 @@ from .display_utils import (resize_display, set_dpi, set_cursor_size, parse_gpu_
                             wayland_reposition_primary,
                             parse_resize_dims, cursor_size_for_dpi, align_dims_16)
 from .webrtc_utils import SystemMonitor, Metrics, GPUMonitor, get_rtc_configuration
+from .ws_sink import WsSink
 from .settings import (settings, AppSettings, SETTING_DEFINITIONS,
                        build_client_settings_payload, sanitize_client_setting)
 from types import SimpleNamespace
@@ -257,6 +258,10 @@ class WebRTCService(BaseStreamingService):
         self._mic_provisioned = False
         self._mic_provision_lock = asyncio.Lock()
 
+        # The websockets-format output of this same service: one capture, one
+        # encoder, two kinds of client on every shared browser base image.
+        self.ws_sink: Optional[WsSink] = WsSink(self)
+
         self._init_default_settings()
 
     def _init_default_settings(self) -> None:
@@ -413,8 +418,10 @@ class WebRTCService(BaseStreamingService):
         # Always enabled: gpu_stats reports nothing without a supported GPU/tool.
         # Keyed to the pipeline's render node so stats describe the encoding GPU.
         stats_gpu_id = parse_gpu_id(getattr(self.args, "gpu_id", ""))
+        # Kept so the stats pushes can name the GPU they describe.
+        self._stats_gpu_id = stats_gpu_id if (stats_gpu_id or 0) > 0 else 0
         self.gpu_monitor = GPUMonitor(
-            gpu_id=stats_gpu_id if (stats_gpu_id or 0) > 0 else 0,
+            gpu_id=self._stats_gpu_id,
             enabled=True,
             dri_node=getattr(self.args, "encode_dri", "") or "",
         )
@@ -590,9 +597,7 @@ class WebRTCService(BaseStreamingService):
         self.rtc_app.on_peer_gone = self.handle_peer_gone
         self.input_handler.on_request_keyframe = self.request_idr_for_display
 
-        self.input_handler.on_cursor_change = lambda data: (
-            self.rtc_app.send_cursor_data(data)
-        )
+        self.input_handler.on_cursor_change = self._fanout_cursor
         self.media_pipeline.on_cursor_data = lambda data: (
             self.input_handler.on_cursor_change(data)
         )
@@ -605,6 +610,14 @@ class WebRTCService(BaseStreamingService):
         self.input_handler.on_clipboard_read = lambda d, t: (
             self.rtc_app.send_clipboard_data(d, t)
         )
+        if self.ws_sink is not None:
+            # Clipboard, system actions and realized resolutions reach the
+            # sink's clients through the same calls the peers are served by, so
+            # an answer addressed at a sink client is delivered where it was
+            # asked for.
+            self.rtc_app.on_ws_clipboard = self.ws_sink.push_clipboard
+            self.rtc_app.on_ws_system = self.ws_sink.push_system
+            self.rtc_app.on_ws_resolution = self.ws_sink.push_stream_resolution
         self.input_handler.on_set_fps = self.handle_fps_change
         self.input_handler.on_client_fps = lambda fps: (
             self.metrics.set_fps(fps) if self.metrics else None
@@ -742,6 +755,15 @@ class WebRTCService(BaseStreamingService):
             )
             self._broadcast_display_config()
         self.send_current_cursor(channel)
+
+    def _fanout_cursor(self, data: dict) -> None:
+        """One cursor change to both outputs: the peers' data channels and, in
+        the websockets `cursor,<json>` format, the sink's clients. The payload
+        is `format_pixelflux_cursor`'s, which IS that format, so nothing is
+        translated here."""
+        self.rtc_app.send_cursor_data(data)
+        if self.ws_sink is not None:
+            self.ws_sink.push_cursor(data)
 
     def send_current_cursor(self, channel: Optional[Any] = None) -> None:
         """Resend the current cursor (on channel open / video restart): to one
@@ -1168,13 +1190,8 @@ class WebRTCService(BaseStreamingService):
         self._primary_stop_grace_task = asyncio.create_task(_stop_after_grace())
 
     def _primary_display_has_consumer(self) -> bool:
-        """Whether any peer (controller or viewer) still consumes the primary."""
-        if self.rtc_app is None:
-            return False
-        return any(
-            (p.get("display_id") or "primary") == "primary"
-            for p in self.rtc_app.peer_connections.values()
-        )
+        """Whether any consumer (peer or sink client) still holds the primary."""
+        return bool(self._display_consumers("primary"))
 
     def _wayland_capture_handle(self) -> Optional[Any]:
         """A pixelflux handle for compositor output management (any ScreenCapture
@@ -1418,14 +1435,20 @@ class WebRTCService(BaseStreamingService):
             logger.warning(f"Wayland cursor resize failed: {e}")
 
     def _display_consumers(self, display_id: str) -> List[Dict[str, Any]]:
-        """Registered peers (controller + viewers) consuming this display's
-        stream."""
-        if self.rtc_app is None:
-            return []
-        return [
-            p for p in self.rtc_app.peer_connections.values()
-            if (p.get("display_id") or "primary") == display_id
-        ]
+        """Every consumer of this display's stream, whatever its transport:
+        registered peers (controller + viewers) and the WebSocket sink's
+        clients, which publish the same `video_paused`/`audio_paused` fields.
+        Capture start, the grace stop and `_settle_primary_consumers` therefore
+        need no knowledge of the sink at all."""
+        consumers = []
+        if self.rtc_app is not None:
+            consumers = [
+                p for p in self.rtc_app.peer_connections.values()
+                if (p.get("display_id") or "primary") == display_id
+            ]
+        if self.ws_sink is not None:
+            consumers = consumers + self.ws_sink.display_consumers(display_id)
+        return consumers
 
     async def handle_peer_gone(
         self, peer_id: str, peer: Optional[Dict[str, Any]] = None
@@ -1551,7 +1574,10 @@ class WebRTCService(BaseStreamingService):
         the media stream and the client-side grant, which otherwise persist
         until the peer disconnects itself. A slot-only change keeps the peer
         but is pushed as a role_update (websockets ROLE_UPDATE parity): the
-        gamepad slot mapping lives client-side and would silently desync."""
+        gamepad slot mapping lives client-side and would silently desync. The
+        WebSocket sink's clients are reconciled here too: they hold the same
+        tokens and neither of the other two reconciliations walks them."""
+        await self._reconcile_sink_clients()
         if self.rtc_app is None:
             return
         tokens, mk = current_session_tokens()
@@ -1585,6 +1611,14 @@ class WebRTCService(BaseStreamingService):
                     except Exception:
                         logger.debug("role_update send failed (channel closing)", exc_info=True)
 
+    async def _reconcile_sink_clients(self) -> None:
+        """Apply a token update to the sink's clients too. Reached from the
+        WebRTC reconciliation, which the websockets `/api/tokens` handler
+        invokes as its hook: without this a revoked share link would keep
+        receiving media over the sink."""
+        if self.ws_sink is not None:
+            await self.ws_sink.reconcile()
+
     async def handle_consumers_changed(self, display_id: str) -> None:
         """A peer joined or left a display's consumer set: re-evaluate the
         all-paused stop in both directions - a departing unpaused peer cannot
@@ -1596,6 +1630,11 @@ class WebRTCService(BaseStreamingService):
         audio pauses. (A departing controller's pipeline is torn down
         elsewhere; the pause and resume calls no-op on a stopped pipeline.)"""
         display_id = display_id or "primary"
+        if self.ws_sink is not None:
+            # One controller per display, whatever the transport: a controller
+            # peer that just took this display supersedes a sink controller on
+            # it, the way two tabs on one transport always superseded.
+            self.ws_sink.supersede_by_peer_controllers()
         pipeline = self.display_pipelines.get(display_id)
         if pipeline is None:
             return
@@ -2136,6 +2175,16 @@ class WebRTCService(BaseStreamingService):
                 self.system_monitor.mem_total,
                 self.system_monitor.mem_used,
             )
+            if self.ws_sink is not None:
+                # The same numbers in the websockets spelling, plus each sink
+                # client's own bandwidth and RTT: the data channel's messages
+                # mean nothing to a websockets client.
+                self.ws_sink.push_system_stats(
+                    self.system_monitor.cpu_percent,
+                    self.system_monitor.mem_total,
+                    self.system_monitor.mem_used,
+                )
+                self.ws_sink.push_network_stats()
             self.rtc_app.send_ping(t)
         if self.media_pipeline is not None:
             try:
@@ -2149,6 +2198,9 @@ class WebRTCService(BaseStreamingService):
         """GPU-monitor tick: push GPU stats to clients and into metrics."""
         if self.rtc_app:
             self.rtc_app.send_gpu_stats(load, memory_total, memory_used)
+        if self.ws_sink is not None:
+            self.ws_sink.push_gpu_stats(load, memory_total, memory_used,
+                                        gpu_id=getattr(self, "_stats_gpu_id", 0))
         if self.metrics:
             self.metrics.set_gpu_utilization(load * 100)
 
@@ -2357,6 +2409,11 @@ class WebRTCService(BaseStreamingService):
             logger.debug(
                 f"Updated setting '{key}' for display '{display_id}' from {current_value} to {sanitized_value}"
             )
+        if self.ws_sink is not None:
+            # A websockets client keys its wire-format demux off server_settings,
+            # so every sink client is re-told after a settings pass (the peers
+            # negotiate their codec over SDP and need no such re-announcement).
+            await self.ws_sink.broadcast_server_settings()
 
     def mon_rtc_config(
         self, stun_servers: List[str], turn_servers: List[str], rtc_config: Any
@@ -2481,6 +2538,12 @@ class WebRTCService(BaseStreamingService):
                 if window["goodput_bps"]:
                     bucket["goodputs"].append(window["goodput_bps"])
                 bucket["worst_loss"] = max(bucket["worst_loss"], window["loss_fraction"])
+            if self.ws_sink is not None:
+                # Each sink client's smoothed goodput and its relay's loss
+                # signal, in the shape a peer's TWCC window has: the rule below
+                # (slowest consumer wins, back off on loss) then covers them
+                # unchanged. With no sink client nothing is added.
+                self.ws_sink.merge_congestion(per_display)
             if self.metrics is not None:
                 self.metrics.set_bridge_drops(rtc_app.bridge_drops())
             for did, bucket in per_display.items():
@@ -2615,6 +2678,12 @@ class WebRTCService(BaseStreamingService):
         self._shutdown_called = True
         logger.info("Starting shutdown sequence")
 
+        if self.ws_sink is not None:
+            # Before anything else: no new socket is accepted from here on, the
+            # connected ones are closed and their handlers drained, so none is
+            # still inside the pipeline when it is torn down (patch 0005's rule,
+            # which the sink implements for itself).
+            await self.ws_sink.stop()
         self._cancel_primary_stop_grace()
         for task in list(self.tasks):
             try:
@@ -2802,6 +2871,8 @@ class WebRTCService(BaseStreamingService):
     async def start(self) -> None:
         """Supervisor entry point: run the service until stop() is called."""
         self.shutdown_event.clear()
+        if self.ws_sink is not None:
+            self.ws_sink.start()
         await self.run()
 
     async def stop(self) -> None:
