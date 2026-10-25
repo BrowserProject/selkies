@@ -1,0 +1,19 @@
+# Patch tests, in the order the base image build ran them.
+stream_switch_test.py
+ws_sink_test.py
+stream_twcc_test.py
+stream_bridge_test.py
+stream_resize_test.py
+display_refresh_test.py
+display_resize_test.py
+input_loops_test.py
+input_queue_test.py
+clipboard_transfer_test.py
+keyboard_level_test.py
+stream_pacer_test.py
+stream_sender_test.py
+stream_consumers_test.py
+signaling_keepalive_test.py
+ice_consent_test.py
+peer_closed_signal_test.py
+rtc_config_monitor_test.py
