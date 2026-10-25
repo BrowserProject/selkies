@@ -44,6 +44,7 @@ import re
 import secrets
 import socket
 import threading
+import time
 from collections.abc import Callable
 from typing import Optional, Union, cast
 
@@ -58,8 +59,12 @@ logger = logging.getLogger(__name__)
 ICE_COMPLETED = 1
 ICE_FAILED = 2
 
-CONSENT_FAILURES = 6
 CONSENT_INTERVAL = 5
+# RFC 7675: consent expires after this long without any answer to a check.
+CONSENT_TIMEOUT = 30
+# Each check is retransmitted (0.5, 1.5, 3.5 s) and waits 7.5 s in all, so an
+# answer slower than the first STUN RTO still counts.
+CONSENT_RETRANSMISSIONS = 3
 # Seconds a connection waits for a path only the peer can open (its nomination
 # of an ICE-lite agent, its connection to a passive TCP candidate).
 INBOUND_CHECK_TIMEOUT = 30
@@ -1386,28 +1391,44 @@ class Connection:
     async def query_consent(self) -> None:
         """
         Periodically check consent (RFC 7675).
-        """
-        failures = 0
-        while True:
-            # randomize between 0.8 and 1.2 times CONSENT_INTERVAL
-            await asyncio.sleep(CONSENT_INTERVAL * (0.8 + 0.4 * random.random()))
 
-            for pair in self._nominated.values():
-                request = self.build_request(pair, nominate=False)
-                try:
-                    await pair.protocol.request(
-                        request,
-                        pair.remote_addr,
-                        integrity_key=self.remote_password.encode("utf8"),
-                        retransmissions=0,
-                    )
-                    failures = 0
-                except stun.TransactionError:
-                    failures += 1
-                if failures >= CONSENT_FAILURES:
-                    self.__log_info("Consent to send expired")
-                    self._query_consent_task = None
-                    return await self.close()
+        Consent expires only after CONSENT_TIMEOUT without any answer. Every
+        check runs as its own transaction, so a path whose round trip exceeds
+        the first STUN RTO (a far TURN relay, a bufferbloated link) keeps its
+        consent instead of losing it to a row of late answers.
+        """
+        answered_at = time.monotonic()
+        checks: set[asyncio.Task] = set()
+
+        async def check(pair: CandidatePair) -> None:
+            nonlocal answered_at
+            try:
+                await pair.protocol.request(
+                    self.build_request(pair, nominate=False),
+                    pair.remote_addr,
+                    integrity_key=self.remote_password.encode("utf8"),
+                    retransmissions=CONSENT_RETRANSMISSIONS,
+                )
+            except stun.TransactionError:
+                return
+            answered_at = time.monotonic()
+
+        try:
+            while True:
+                # randomize between 0.8 and 1.2 times CONSENT_INTERVAL
+                await asyncio.sleep(CONSENT_INTERVAL * (0.8 + 0.4 * random.random()))
+                if time.monotonic() - answered_at >= CONSENT_TIMEOUT:
+                    break
+                for pair in self._nominated.values():
+                    task = asyncio.create_task(check(pair))
+                    checks.add(task)
+                    task.add_done_callback(checks.discard)
+        finally:
+            for task in list(checks):
+                task.cancel()
+        self.__log_info("Consent to send expired")
+        self._query_consent_task = None
+        await self.close()
 
     def data_received(self, data: Optional[bytes], component: Optional[int]) -> None:
         self._queue.put_nowait((data, component))
