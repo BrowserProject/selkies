@@ -24,10 +24,13 @@
 #     the largest of the last IDR_WINDOW keyframes). A budget below one IDR
 #     truncates every keyframe under sustained congestion and breaks the
 #     reference chain permanently, hence the sliding-window floor.
-#   * Overflow drops the whole GOP and requests a throttled keyframe rather
-#     than thinning arbitrary packet tails; a timeout resurrects video if no
-#     keyframe arrives, so an unbound keyframe callback or a stuck encoder
-#     cannot kill the class permanently (natural IDR cadence can be minutes).
+#   * Overflow drops the whole GOP (the queued video and everything until the
+#     next keyframe) and requests a throttled keyframe rather than thinning
+#     arbitrary packet tails; a keyframe that would not fit beside the video
+#     still queued drops that video first, so a recovery keyframe always goes
+#     out whole. A timeout resurrects video if no keyframe arrives, so an
+#     unbound keyframe callback or a stuck encoder cannot kill the class
+#     permanently (natural IDR cadence can be minutes).
 #   * Rate control is AIMD on wire evidence: an internal overflow only proves
 #     injection > drain, and with UDP sends the drain is the pace setting, not
 #     the wire — once one brake drops the pace below the encoder rate, every
@@ -84,6 +87,9 @@ CAP_MIN_MS = 120
 # IDR sizes.
 IDR_FLOOR_FACTOR = 2.2
 IDR_WINDOW = 4
+# Wire bytes per keyframe payload byte: RTP and SRTP headers plus one FlexFEC
+# repair packet per ten media packets.
+KEYFRAME_WIRE_FACTOR = 1.2
 KEYREQ_MIN_INTERVAL_S = 0.5
 # Sanity floor: a 0-goodput feedback window must never stall (or
 # divide-by-zero) the scheduler.
@@ -358,6 +364,12 @@ class RtpPacer:
         if self._gop_dead:
             self._gop_dead = False
             self.stats["idr_resurrects"] += 1
+        if self._video_bytes and self._video_bytes + size * KEYFRAME_WIRE_FACTOR > self._video_cap_bytes():
+            # The decoder restarts at this keyframe, so what is queued ahead of
+            # it is worth less than the keyframe arriving whole.
+            logger.info("pacer: %d queued video bytes dropped ahead of a %d-byte keyframe",
+                        self._video_bytes, size)
+            self._purge_video()
 
     def request_keyframe_once(self) -> None:
         now = time.monotonic()
@@ -442,21 +454,15 @@ class RtpPacer:
                 await sender(data)
                 return
 
-        # Video queue budget: purge oldest video to fit, then GOP-reset.
+        # Video queue budget: an overflow resets the GOP. The queued video and
+        # this packet belong to the GOP the decoder can no longer complete, so
+        # all of it goes and the queue is empty for the recovery keyframe.
         # cap is video-only: audio/DC can never push an IDR out.
-        if cls == CLASS_VIDEO:
-            cap = self._video_cap_bytes()
-            if self._video_bytes + n > cap:
-                self._reset_gop()
-                while self._queues[CLASS_VIDEO] and self._video_bytes + n > cap:
-                    old = self._queues[CLASS_VIDEO].popleft()
-                    self._video_ts.popleft()
-                    self._video_bytes -= len(old)
-                    self._bytes_queued -= len(old)
-                    self.stats["video_dropped"] += 1
-                if self._video_bytes + n > cap:
-                    self.stats["video_dropped"] += 1
-                    return
+        if cls == CLASS_VIDEO and self._video_bytes + n > self._video_cap_bytes():
+            self._reset_gop()
+            self._purge_video()
+            self.stats["video_dropped"] += 1
+            return
 
         self._queues[cls].append(data)
         if cls == CLASS_VIDEO:
@@ -475,9 +481,9 @@ class RtpPacer:
 
     def _stale_reset(self, deadline_s: float) -> None:
         """Latency-first branch of GOP reset used when queued video outlives
-        its usefulness: unlike a cap overflow (which trims only what doesn't
-        fit), everything in the video queue belongs to the same late GOP, so
-        the whole queue is purged to make room for the fresh keyframe."""
+        its usefulness: like a cap overflow, everything in the video queue
+        belongs to the same late GOP, so the whole queue is purged to make
+        room for the fresh keyframe."""
         n = len(self._queues[CLASS_VIDEO])
         self._reset_gop("video backlog stale (>%.0fms, %d pkts purged)"
                         % (deadline_s * 1000, n))
