@@ -330,8 +330,9 @@ class PipelineBridge:
             return
         if keyframe:
             if queue.full():
-                queue.get_nowait()
-                self.dropped += 1
+                while not queue.empty():
+                    queue.get_nowait()
+                    self.dropped += 1
             queue.put_nowait(data)
             self._queued_keyframe = True
             self._gated_at = None
@@ -347,9 +348,6 @@ class PipelineBridge:
             self._gated_at = None
         if queue.full():
             self.dropped += 1
-            if not self._queued_keyframe:
-                queue.get_nowait()
-                self.dropped += 1
             self._gated_at = now
             self._ask(now)
             return
@@ -1774,7 +1772,7 @@ class RTCApp:
         graph = self.displays.get(display_id)
         if graph is None and (client_type is ClientType.CONTROLLER or display_id == "primary"):
             graph = {"relay": MediaRelay()}
-            graph["video_bridge"] = PipelineBridge(request_keyframe=self._keyframe_request(display_id))
+            graph["video_bridge"] = PipelineBridge(maxsize=3, request_keyframe=self._keyframe_request(display_id))
             graph["video_media"] = VideoMedia(graph["video_bridge"])
             if display_id == "primary":
                 graph["audio_bridge"] = PipelineBridge(maxsize=8)

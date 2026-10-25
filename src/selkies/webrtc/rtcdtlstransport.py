@@ -421,6 +421,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         # transport-wide congestion control: one sequence-number space shared by
         # every sender on this transport, a bounded send history for matching the
         # receiver's feedback, and the latest loss/delay estimate derived from it.
+        self._twcc_pending_loss = {}
         self._twcc_seq = 0
         self._twcc_history: dict[int, tuple[int, float]] = {}
         self.twcc_estimate: Optional[dict] = None
@@ -899,9 +900,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         size and send time for matching against the receiver's transport-cc feedback."""
         seq = self._twcc_seq
         self._twcc_seq = (self._twcc_seq + 1) & 0xFFFF
-        self._twcc_history[seq] = (size, time.time())
+        self._twcc_history[seq] = (size, time.monotonic())
         if len(self._twcc_history) > 2048:
-            for old in sorted(self._twcc_history)[:1024]:
+            for old in list(self._twcc_history)[:1024]:
                 self._twcc_history.pop(old, None)
         return seq
 
@@ -929,46 +930,62 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                     statuses.append((chunk >> (12 - 2 * i)) & 0x3)
         statuses = statuses[:status_count]
 
-        received = bytes_acked = 0
-        delta_sum_us = 0.0
-        for i, symbol in enumerate(statuses):
-            if symbol in (1, 2):
-                received += 1
-                if pos < len(fci):
-                    if symbol == 1:
-                        delta_sum_us += fci[pos] * 250
-                        pos += 1
-                    elif pos + 2 <= len(fci):
-                        delta_sum_us += (
-                            struct.unpack("!h", fci[pos : pos + 2])[0] * 250
-                        )
-                        pos += 2
-                sent = self._twcc_history.pop((base_seq + i) & 0xFFFF, None)
-                if sent is not None:
-                    bytes_acked += sent[0]
-        if not statuses:
+        if len(statuses) != status_count or not statuses or 3 in statuses:
             return
-        lost = len(statuses) - received
-        # Receive-side pacing span; against bytes_acked this bounds goodput, and its
-        # growth across feedbacks indicates queuing delay building up.
-        span_s = max(delta_sum_us / 1e6, 1e-4)
+        reference = int.from_bytes(fci[4:7], "big") * 64000
+        wrap = (1 << 24) * 64000
+        previous = getattr(self, "_twcc_reference_us", reference)
+        reference += round((previous - reference) / wrap) * wrap
+        arrival = reference
+        arrivals = []
+        for symbol in statuses:
+            if symbol:
+                length = 1 if symbol == 1 else 2
+                if pos + length > len(fci):
+                    return
+                arrival += int.from_bytes(fci[pos:pos + length], "big", signed=symbol == 2) * 250
+                pos += length
+                arrivals.append(arrival)
+            else:
+                arrivals.append(None)
+        self._twcc_reference_us = max(previous, reference)
+        received = bytes_acked = lost = 0
+        matched = []
+        for i, arrival in enumerate(arrivals):
+            seq = (base_seq + i) & 0xFFFF
+            sent = self._twcc_history.get(seq)
+            if sent is None:
+                continue
+            if arrival is None:
+                self._twcc_pending_loss.setdefault(seq, time.monotonic())
+            else:
+                self._twcc_history.pop(seq, None)
+                self._twcc_pending_loss.pop(seq, None)
+                received += 1
+                bytes_acked += sent[0]
+                matched.append(arrival)
+                transit = arrival / 1e6 - sent[1]
+                prior = self._twcc_window["min_transit"]
+                self._twcc_window["min_transit"] = transit if prior is None else min(prior, transit)
+        if not received and not lost:
+            return
+        first = min(matched) if matched else None
+        last = max(matched) if matched else None
+        span_s = max((last - first) / 1e6, 1e-4) if matched else 1e-4
         self.twcc_estimate = {
-            "received": received,
-            "lost": lost,
-            "loss_fraction": lost / len(statuses),
-            "bytes_acked": bytes_acked,
-            "recv_span_s": span_s,
+            "received": received, "lost": lost,
+            "loss_fraction": lost / (received + lost),
+            "bytes_acked": bytes_acked, "recv_span_s": span_s,
             "goodput_bps": int(bytes_acked * 8 / span_s) if received else 0,
         }
         window = self._twcc_window
         window["received"] += received
         window["lost"] += lost
         window["bytes_acked"] += bytes_acked
-        window["span_s"] += span_s
-        if self._pacer is not None and bytes_acked >= MIN_GOODPUT_SAMPLE_BYTES:
-            # Windows carrying almost no data (pure keepalive / control)
-            # carry no rate signal; feeding them to the pacer slams the pace.
-            self._pacer.set_goodput_bps(self.twcc_estimate["goodput_bps"])
+        if matched:
+            window["first_us"] = first if window["first_us"] is None else min(window["first_us"], first)
+            window["last_us"] = last if window["last_us"] is None else max(window["last_us"], last)
+            window["span_s"] = max((window["last_us"] - window["first_us"]) / 1e6, 1e-4)
         logger.debug(
             "TWCC feedback: recv=%d lost=%d goodput=%s bps",
             received,
@@ -978,7 +995,8 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
     @staticmethod
     def _twcc_window_zero() -> dict:
-        return {"received": 0, "lost": 0, "bytes_acked": 0, "span_s": 0.0}
+        return {"received": 0, "lost": 0, "bytes_acked": 0, "span_s": 0.0,
+                "first_us": None, "last_us": None, "min_transit": None}
 
     def take_twcc_window(self) -> Optional[dict]:
         """Drain the transport-cc feedback accumulated since the last call.
@@ -995,13 +1013,32 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             Loss and goodput over the drained interval, or None when no feedback
             arrived in it.
         """
+        from ..stream_control import CONFIG
         window = self._twcc_window
+        now = time.monotonic()
+        for seq, missing_at in list(self._twcc_pending_loss.items()):
+            if now - missing_at >= CONFIG["reorder_seconds"]:
+                self._twcc_pending_loss.pop(seq, None)
+                if self._twcc_history.pop(seq, None) is not None:
+                    window["lost"] += 1
         packets = window["received"] + window["lost"]
         if not packets:
             return None
         self._twcc_window = self._twcc_window_zero()
+        queue_delay = 0.0
+        transit = window["min_transit"]
+        if transit is not None:
+            floor = getattr(self, "_twcc_delay_floor", transit)
+            queue_delay = max(0.0, transit - floor - CONFIG["delay_drift_seconds"])
+            # A stable route delay must not permanently pin bitrate to the floor.
+            rise = max(CONFIG["delay_drift_seconds"], (transit - floor) * CONFIG["delay_baseline_alpha"])
+            self._twcc_delay_floor = min(transit, floor + rise)
         span_s = max(window["span_s"], 1e-4)
+        goodput = int(window["bytes_acked"] * 8 / span_s) if window["received"] else 0
+        if self._pacer is not None and window["bytes_acked"] >= MIN_GOODPUT_SAMPLE_BYTES:
+            self._pacer.set_goodput_bps(goodput)
         return {
+            "queue_delay_s": queue_delay,
             "received": window["received"],
             "lost": window["lost"],
             "loss_fraction": window["lost"] / packets,

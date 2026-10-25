@@ -411,9 +411,10 @@ class RTCRtpSender(AsyncIOEventEmitter):
 
             # A retransmission is a new packet on the wire: give it its own
             # transport-wide sequence number.
-            packet.extensions.transport_sequence_number = self.transport._twcc_next(
-                len(packet.payload)
-            )
+            if self.__rtp_header_extensions_map.transport_sequence_number_enabled:
+                packet.extensions.transport_sequence_number = self.transport._twcc_next(
+                    len(packet.payload)
+                )
             self.__log_debug("> %s", packet)
             packet_bytes = packet.serialize(self.__rtp_header_extensions_map)
             await self.transport._send_rtp(packet_bytes, rtc_class=CLASS_VIDEO)
@@ -469,6 +470,9 @@ class RTCRtpSender(AsyncIOEventEmitter):
 
                 timestamp = uint32_add(timestamp_origin, enc_frame.timestamp)
 
+                if self.__kind == "video" and enc_frame.keyframe:
+                    # Old GOP retransmissions compete with the recovery frame for the same link.
+                    self.__rtp_history = RtpHistory()
                 for i, payload in enumerate(enc_frame.payloads):
                     packet = RtpPacket(
                         payload_type=codec.payloadType,
@@ -484,9 +488,10 @@ class RTCRtpSender(AsyncIOEventEmitter):
                         clock.current_ntp_time() >> 14
                     ) & 0x00FFFFFF
                     packet.extensions.mid = self.__mid
-                    packet.extensions.transport_sequence_number = (
-                        self.transport._twcc_next(len(payload))
-                    )
+                    if self.__rtp_header_extensions_map.transport_sequence_number_enabled:
+                        packet.extensions.transport_sequence_number = (
+                            self.transport._twcc_next(len(payload))
+                        )
                     if enc_frame.audio_level is not None:
                         packet.extensions.audio_level = (False, -enc_frame.audio_level)
                     # https://webrtc.googlesource.com/src/+/main/docs/native-code/rtp-hdrext/playout-delay/README.md

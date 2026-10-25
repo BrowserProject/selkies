@@ -96,6 +96,10 @@ class HeaderExtensionsMap:
     def __init__(self) -> None:
         self.__ids = HeaderExtensions()
 
+    @property
+    def transport_sequence_number_enabled(self) -> bool:
+        return self.__ids.transport_sequence_number is not None
+
     def configure(self, parameters: RTCRtpParameters) -> None:
         for ext in parameters.headerExtensions:
             if ext.uri == "urn:ietf:params:rtp-hdrext:sdes:mid":
@@ -645,7 +649,7 @@ class RtcpRtpfbPacket:
 
     @classmethod
     def parse(cls, data: bytes, fmt: int) -> "RtcpRtpfbPacket":
-        if len(data) < 8 or len(data) % 4:
+        if len(data) < 8 or (fmt == RTCP_RTPFB_NACK and len(data) % 4):
             raise ValueError("RTCP RTP feedback length is invalid")
 
         ssrc, media_ssrc = unpack("!LL", data[0:8])
