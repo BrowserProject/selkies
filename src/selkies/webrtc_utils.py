@@ -486,11 +486,22 @@ class RTCConfigFileMonitor(FileSystemEventHandler):
         self.observer.schedule(self, self.watch_dir, recursive=False)
 
     async def start(self) -> None:
-        """Starts the watchdog observer thread; no-op when disabled."""
+        """Starts the watchdog observer thread; no-op when disabled.
+
+        The file was read when the service started, so a watch the kernel
+        refuses (the inotify instances of one user are a single per-host
+        budget) only costs the live reload: the monitor disables itself
+        rather than failing the WebRTC service.
+        """
         if not self.enabled:
             return
 
-        await asyncio.to_thread(self.observer.start)
+        try:
+            await asyncio.to_thread(self.observer.start)
+        except OSError as e:
+            self.enabled = False
+            logger_rtcice.warning(f"RTC config file monitor not started for {self.rtc_file}; changes apply after a restart: {e}")
+            return
         logger_rtcice.info(f"RTC config file monitor started for: {self.rtc_file}")
 
     def _shutdown_observer(self) -> None:
