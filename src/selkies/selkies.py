@@ -3137,6 +3137,32 @@ class DataStreamingServer(BaseStreamingService):
             perms = client_permissions.get(websocket)
         return _perms_hold_input_authority(perms)
 
+    async def _take_over_display_if_needed(
+        self, websocket, display_id: str, first_settings: bool
+    ) -> bool:
+        display_state = self.display_clients[display_id]
+        if display_state.get('ws') is websocket:
+            return False
+        data_logger.info(
+            f"Client is taking over existing display '{display_id}'. Updating state for new connection."
+        )
+        display_state['ws'] = websocket
+        if first_settings:
+            display_state['video_active'] = self._video_start_state(websocket, display_id)
+        display_state['acknowledged_frame_id'] = -1
+        display_state['acked_sent_at'] = None
+        display_state['unacked_since'] = None
+        display_state['stall_gated_at'] = None
+        display_state['sent_timestamps'].clear()
+        display_state['rtt_samples'].clear()
+        display_state['smoothed_rtt'] = 0.0
+        try:
+            await websocket.send_str(f"PIPELINE_RESETTING {display_id}")
+        except (ConnectionResetError, OSError, RuntimeError):
+            pass
+        self._schedule_idr_for_display(display_id)
+        return True
+
     async def ws_handler(
         self,
         websocket: web.WebSocketResponse,
@@ -3729,27 +3755,8 @@ class DataStreamingServer(BaseStreamingService):
                                             getattr(app_settings, "scaling_dpi", "96") or 96,
                                             display_id))
                             else:
-                                data_logger.info(f"Client is taking over existing display '{display_id}'. Updating state for new connection.")
-                                display_state = self.display_clients[display_id]
-                                display_state['ws'] = websocket
-                                # Only a page's first SETTINGS reactivates video; a later one
-                                # must not resurrect a stream stopped with STOP_VIDEO.
-                                if not initial_settings_processed:
-                                    display_state['video_active'] = self._video_start_state(websocket, display_id)
-                                display_state['acknowledged_frame_id'] = -1
-                                display_state['acked_sent_at'] = None
-                                display_state['unacked_since'] = None
-                                display_state['stall_gated_at'] = None
-                                display_state['sent_timestamps'].clear()
-                                display_state['rtt_samples'].clear()
-                                display_state['smoothed_rtt'] = 0.0
-                                # A warm takeover keeps the capture; no reconfigure runs when
-                                # the dimensions are unchanged, so the reset and IDR go here.
-                                try:
-                                    await websocket.send_str(f"PIPELINE_RESETTING {display_id}")
-                                except (ConnectionResetError, OSError, RuntimeError):
-                                    pass
-                                self._schedule_idr_for_display(display_id)
+                                await self._take_over_display_if_needed(
+                                    websocket, display_id, not initial_settings_processed)
  
                             await self._apply_client_settings(
                                 websocket,
