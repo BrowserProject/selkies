@@ -1,4 +1,4 @@
-/*
+/*!
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -27,8 +27,13 @@
  * payload of any size. `HASH_BYTES` covers the one caller holding bytes that
  * did not come through a codec, and `REENCODE_PNG` normalizes an image to PNG
  * on an OffscreenCanvas rather than on the page's own.
+ *
+ * Bundle hook (lib/clipboard-worker-bridge.js): the worker runs from the source of
+ * `clipboardWorker` in a Blob, so no worker file is emitted or fetched; the body
+ * therefore stays self-contained (no imports, nothing from module scope).
  * @module
  */
+function clipboardWorker() {
 
 /** Bytes per `String.fromCharCode.apply` call, keeping its argument list bounded. */
 const CHUNK_SIZE = 0x8000;
@@ -220,7 +225,7 @@ self.onmessage = function(e) {
             self.postMessage({ id, success: true, result: base64,
                                byteLength: bytes.byteLength,
                                hash: hashBytes(e.data.hash === undefined ? HASH_SEED : e.data.hash, bytes) });
-        } 
+        }
         else if (action === 'ENCODE_TEXT_TO_B64') {
             const base64 = stringToBase64(payload);
             self.postMessage({ id, success: true, result: base64 });
@@ -244,3 +249,7 @@ self.onmessage = function(e) {
         self.postMessage({ id, success: false, error: err.message });
     }
 };
+}
+
+/** The worker script, run by the bridge from a Blob URL. */
+export const CLIPBOARD_WORKER_SOURCE = `(${clipboardWorker.toString()})();\n`;

@@ -1,4 +1,4 @@
-/* This Source Code Form is subject to the terms of the Mozilla Public
+/*! This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
@@ -51,8 +51,8 @@ const JSDB_PLATFORM = (() => {
 /**
  * Polls every connected pad and reports changes through callbacks.
  *
- * Polling starts in the constructor and runs until `destroy`; `enable` and
- * `disable` pause it without losing per-pad state.
+ * Polling starts in the constructor and runs until `destroy`; `disable` stops
+ * the timer and `enable` starts it again, both without losing per-pad state.
  */
 export class GamepadManager {
     /**
@@ -73,23 +73,39 @@ export class GamepadManager {
         this._lastHeldBeat = 0;
         this.state = {};
         this._active = true;
+        this.interval = null;
+        this._startPolling();
+    }
+
+    /** Starts the polling timer if it is not running. */
+    _startPolling() {
+        if (this.interval !== null) return;
         this.interval = setInterval(() => {
             this._poll();
         }, GP_TIMEOUT);
+    }
+
+    /** Stops the polling timer if it is running. */
+    _stopPolling() {
+        if (this.interval === null) return;
+        clearInterval(this.interval);
+        this.interval = null;
     }
 
     /** Resumes polling. */
     enable() {
         if (!this._active) {
             this._active = true;
+            this._startPolling();
             console.log("GamepadManager polling activated.");
         }
     }
 
-    /** Pauses polling; the per-pad state is kept. */
+    /** Pauses polling; the per-pad state is kept, and no timer runs meanwhile. */
     disable() {
         if (this._active) {
             this._active = false;
+            this._stopPolling();
             console.log("GamepadManager polling deactivated.");
         }
     }
@@ -153,7 +169,14 @@ export class GamepadManager {
         if (!this._active) {
             return;
         }
-        const gamepads = navigator.getGamepads();
+        // Insecure contexts and older WebKit have no getGamepads, or throw.
+        let gamepads;
+        try {
+            gamepads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : null;
+        } catch (e) {
+            return;
+        }
+        if (!gamepads) return;
         for (let i = 0; i < MAX_GAMEPADS; i++) {
             const currentGp = gamepads[i];
             if (currentGp) {
@@ -292,7 +315,7 @@ export class GamepadManager {
 
     /** Stops polling and forgets every pad. */
     destroy() {
-        clearInterval(this.interval);
+        this._stopPolling();
         this.state = {};
         console.log("GamepadManager destroyed.");
     }

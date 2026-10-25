@@ -1,4 +1,9 @@
-/*
+import { applyStreamProfile, publishStreamProfile } from './lib/stream-profile.js';
+import { pasteFromPanel, cancelPanelPaste } from './lib/mobile-clipboard.js';
+import { createViewerLifecycle } from "./lib/viewer-lifecycle.js";
+import { watchStreamVisibility } from "./lib/stream-visibility.js";
+import { decideFirstFrameRecovery } from "./lib/first-frame-recovery.js";
+/*!
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -19,8 +24,7 @@
  * page's thread can interrupt any of them.
  * Binary messages are typed by their first byte. From the server: `0x01`
  * audio (Opus, with the RED redundancy layout documented on
- * extractOpusFrames), `0x03` a JPEG stripe (`u8 reserved`, `u16 frame id`,
- * `u16 stripe Y`, JPEG data), `0x04` an H.264 stripe or full frame (`u8
+ * extractOpusFrames), `0x04` an H.264 stripe or full frame (`u8
  * keyframe`, `u16 frame id`, `u16 stripe Y`, `u16 width`, `u16 height`,
  * Annex-B data), and `0x05` a gzip-wrapped control text once the client
  * advertised `_gz,1`. From the
@@ -30,7 +34,7 @@
  * `START_VIDEO`, `STOP_VIDEO`, `START_AUDIO`, `STOP_AUDIO`,
  * `REQUEST_KEYFRAME`, `CLIENT_FRAME_ACK <id> <heldMs>`, `cr`, `REQUEST_CLIPBOARD`, the
  * chunked clipboard upload of lib/clipboard-worker-bridge.js,
- * `cmd,<command>`, `SET_NATIVE_CURSOR_RENDERING,<0|1>`,
+ * `cmd,<command>`, `ctl,<take|release|status>`, `SET_NATIVE_CURSOR_RENDERING,<0|1>`,
  * `vp,<originX>,<originY>,<scaleX>,<scaleY>` (this page's stream box on the
  * user's desktop, relayed to the other displays) and the input verbs of
  * lib/input.js. The server sends `MODE websockets`, `AUTH_SUCCESS,{json}`,
@@ -41,10 +45,10 @@
  * `KILL <reason>`, the clipboard family (`clipboard,`, `clipboard_binary,`,
  * `clipboard_start,`, `clipboard_data,`, `clipboard_finish`,
  * `clipboard_reply,`), and JSON objects typed `server_settings`,
- * `server_apps`, `pipeline_status`, `stream_resolution`, `system_stats`,
+ * `server_apps`, `pipeline_status`, `stream_resolution`, `desktop_control`, `system_stats`,
  * `gpu_stats` and `network_stats`.
  *
- * Video is decoded with WebCodecs: a JPEG stripe through ImageDecoder, an
+ * Video is decoded with WebCodecs: an
  * H.264 stripe through a VideoDecoder per row offset -- in the video worker
  * while the divert holds, on the page as the fallback -- and a full frame --
  * controller or shared viewer alike -- in the video worker or through the
@@ -54,7 +58,9 @@
  * striped modes composited on a back-buffer and blitted whole at frame
  * boundaries. Audio is decoded in a worker and played through an
  * AudioWorklet, the microphone is encoded to Opus in a worker, and the webcam
- * is lib/webcam-capture.js.
+ * is lib/webcam-capture.js. Without a VideoDecoder, or with one that refuses
+ * the stream's H.264, the socket is marked undecodable and drops video before
+ * any decoder.
  *
  * Dashboards talk to the core over same-origin window messages. The core
  * handles `setVolume`, `setMute`, `setScaleLocally`, `setSynth`,
@@ -63,13 +69,15 @@
  * `settings`, `getStats`, `clipboardUpdateFromUI`, `clipboardImageUpdate`,
  * `pipelineStatusUpdate`, `pipelineControl`, `audioDeviceSelected`,
  * `gamepadControl`, `requestFullscreen`, `command`, `touchinput:trackpad`,
- * `touchinput:touch` and `sidebarVisibilityChanged`, and posts
+ * `touchinput:touch`, `sidebarVisibilityChanged` and `desktopControlCommand`
+ * (lib/desktop-control.js), and posts
  * `pipelineStatusUpdate`, `sidebarButtonStatusUpdate`, `serverSettings`,
  * `systemApps`, `stats` (to the parent window), `clientRoleUpdate`,
  * `effectiveCursorState`, `trackpadModeUpdate`, `clipboardContentUpdate`,
- * the clipboard preview of lib/clipboard-sync.js, `fileUpload`,
- * `toggleDashboard` and `toggleTouchGamepad`. The `window` globals it
- * publishes for the dashboards and the tests are `webrtcInput` (the Input
+ * the clipboard preview of lib/clipboard-sync.js, `fileUpload` (clipboard
+ * and command warnings), `toggleDashboard`, `toggleTouchGamepad`,
+ * `desktopControl` and `viewer-core-event` (lib/core-events.js). The `window`
+ * globals it publishes for the dashboards and the tests are `webrtcInput` (the Input
  * handler), `fps`, `videoChunksReceived`, `videoDivertOn`, `videoStripeRows`
  * (the row layout the video worker is decoding), `webcamCodec`,
  * `system_stats`, `gpu_stats`,
@@ -107,41 +115,29 @@ import {
   localClipboardBlocker,
   createDeferredClipboardWriter,
   clipboardPreviewMessage,
-  digestedPayload
+  digestedPayload,
+  pageClipboardSyncState
 } from './lib/clipboard-sync.js';
 import { ClipboardWorkerBridge, sendClipboardChunked } from './lib/clipboard-worker-bridge.js';
-import { streamDensity as streamDensityOf } from './lib/stream-density.js';
-import {
-  createFileUploader
-} from './lib/file-upload.js';
-import { detectKeyboardLayout } from './lib/keyboard-layout.js';
+// Policy hook (lib/stream-policy.js): the project's sizing policy wraps upstream stream-density.js.
+import { streamDensity as streamDensityOf, uiDensity, smallScreenDefault, fitStreamBox } from './lib/stream-policy.js';
+import { readClientRole, displaySegment, pageSharedMode } from './lib/shared-mode.js';
+import { freezeVideoFrame, clearFrozenFrame } from './lib/freeze-frame.js';
+import { postDesktopControl, desktopControlInput, DESKTOP_CONTROL_STATUS } from './lib/desktop-control.js';
 import { installAuthGuard } from './lib/auth-guard.js';
 import { installSessionCookie, sessionAuthHeaders } from './lib/session-token.js';
 import { storageKeyForServerKey, resolveSpec, HIDPI_SPEC } from './lib/conditional-settings.js';
-import { getRoutePrefix, getStorageAppName, canDecodeEncoder, canDecodeFullColor } from './lib/util.js';
+import { getRoutePrefix, getStorageAppName, canDecodeFullColor, selkiesEndpoint, selkiesSocketEndpoint, withSessionPeerId } from './lib/util.js';
 import { createStripeClock } from './lib/stripe-clock.js';
 import { WebcamCapture, WEBCAM_ENCODER_PREFERENCES } from './lib/webcam-capture.js';
+import { postCoreEvent, rememberCoreReload } from './lib/core-events.js';
+// Storage hook (lib/web-storage.js): every localStorage and sessionStorage access goes through these, so a browser that blocks site data still streams.
+import { localStore, sessionStore } from './lib/web-storage.js';
+// Runtime hook (lib/runtime-config.js): the page's own settings for this viewer, written only by runtime.ts.
+import { runtimeConfig } from './lib/runtime-config.js';
 
 installAuthGuard();
 installSessionCookie();
-
-/**
- * Best-effort local keyboard layout, `null` while unknown (and then omitted from
- * settings). Resolved once at script init so it is ready by the time the socket
- * connects; a probe that lands after the initial SETTINGS payload sends the
- * hint on its own, guarded because the connection may not exist yet, and never
- * from a shared viewer, which pushes no settings.
- */
-let detectedKeyboardLayout = null;
-detectKeyboardLayout().then((layout) => {
-    detectedKeyboardLayout = layout;
-    try {
-        if (layout && !isSharedMode && typeof websocket !== 'undefined' && websocket &&
-            websocket.readyState === WebSocket.OPEN) {
-            websocket.send(`SETTINGS,${JSON.stringify({ keyboardLayout: layout })}`);
-        }
-    } catch (e) { /* pre-connect */ }
-});
 
 /** Timestamp of the newest Opus frame handed to the decoder; `null` before RED starts. */
 let lastAudioTs = null;
@@ -218,6 +214,28 @@ function extractOpusFrames(arrayBuffer) {
  * described in the module docblock.
  */
 export default function websockets() {
+const lifecycle = createViewerLifecycle();
+let streamVisibility = null;
+let videoPausedForHiddenTab = false;
+const isStreamHidden = () => streamVisibility?.hidden ?? document.hidden;
+const setTimeout = (...args) => lifecycle.timeout(...args);
+const setInterval = (...args) => lifecycle.interval(...args);
+const requestAnimationFrame = callback => lifecycle.frame(callback);
+let activeClipboardGestures = null;
+let ownedStyle = null;
+/**
+ * Upgrade hook (transport.ts): the nodes and the Input instance THIS core
+ * created, so `stopViewerCore()` can take exactly its own session down.
+ *
+ * While the transport dials WebRTC next to an open sink, a second core instance
+ * lives in the same document. Emptying `#app` or detaching the global
+ * `window.webrtcInput` would then blank the other instance's picture and its
+ * input; only what this core built may go.
+ */
+let ownedVideoContainer = null;
+let ownedKeyboardAssist = null;
+let ownedInputInstance = null;
+
 let isSecondaryDisplayConnected = false;
 /** Display rectangles (+ per-page scale) from the last DISPLAY_CONFIG_UPDATE. */
 let latestDisplayLayouts = null;
@@ -247,7 +265,7 @@ window.currentAudioDropped = 0;
  * element (GPU-composited, no per-frame 2D-canvas draw) by
  * MediaStreamTrackGenerator on the main thread (Chromium) or the standard
  * worker-only VideoTrackGenerator whose track is transferred back here.
- * Full-frame H.264 modes only; striped and JPEG modes, and browsers with
+ * Full-frame H.264 modes only; the striped mode, and browsers with
  * neither generator, keep the canvas path.
  */
 let videoElement = null;
@@ -281,9 +299,6 @@ let sinkRevealGen = 0;
  * cssText every frame.
  */
 let canvasGeomDirty = true;
-let jpegStripeRenderQueue = [];
-/** JPEG stripes handed to a decoder that have not reached the queue yet. */
-let jpegStripeDecodesPending = 0;
 let isVideoPipelineActive = true;
 let isAudioPipelineActive = true;
 let isMicrophoneActive = false;
@@ -342,7 +357,36 @@ let preferredInputDeviceId = null;
 let preferredOutputDeviceId = null;
 let metricsIntervalId = null;
 let backpressureIntervalId = null;
-let reconnectIntervalId = null;
+// In-place stream-socket reconnect (upstream reloads the page instead).
+// A freshly started container refuses its stream endpoint for the first few
+// seconds of a cold start, and a reload on every failed connect loops the
+// whole single-page app and throws away its state. The socket is re-opened in
+// place with bounded exponential backoff, and the React wrapper stays on its
+// spinner (driven by the viewer-status posts) until the stream comes up.
+let reconnectTimeoutId = null;
+let reconnectAttempts = 0;
+let reconnectDisabled = false;
+// Cold-start warmup (never yet connected) retries fast under a low cap so the
+// viewer catches the stream as soon as it is ready; after a successful open
+// the backoff is conservative so a real outage does not hammer the proxy.
+const RECONNECT_COLD_BASE_MS = 500;
+const RECONNECT_COLD_MAX_MS = 3000;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 5000;
+// A connect still pending after this is abandoned for the next retry: one
+// started while the link was down otherwise waits out the kernel's SYN backoff.
+const WS_CONNECT_TIMEOUT_MS = 8000;
+// An open socket that hears nothing for this long is dead; the server sends at
+// least its stats every few seconds.
+const WS_SILENCE_TIMEOUT_MS = 12000;
+function cancelReconnect() {
+  if (reconnectTimeoutId) { clearTimeout(reconnectTimeoutId); reconnectTimeoutId = null; }
+}
+// Set by stopViewerCore() so the close handler, the `system,reload` path and
+// the crash reset do not act after the host page is done with the viewer.
+let viewerCoreStopped = false;
+let healthLogIntervalId = null;
+const HEALTH_LOG_INTERVAL_MS = 10000;
 /**
  * Watchdog for a START_VIDEO lost while the tab was hidden, which would leave a
  * black stream. Armed when the tab becomes visible, cleared on the first
@@ -366,7 +410,6 @@ const VISIBLE_FRAME_PROBE_MS = 2500;
  * exponential backoff so a static stream is not spammed.
  */
 let sharedStallWatchdogId = null;
-let sharedDecoderUnavailableNoticed = false;
 let lastSharedVideoChunkTime = 0;
 let sharedStallRecoveryAttempts = 0;
 let sharedStallNextRecoveryTime = 0;
@@ -410,13 +453,6 @@ let vncStripeDecoders = {};
  * The video worker holds its full-frame decoder to the same contract.
  */
 const STRIPE_DECODE_QUEUE_LIMIT = 8;
-/**
- * A stripe is stale only when it trails the last drawn id by at most this
- * many frames. The id is a uint16, so a larger modular gap means the row sat
- * static for a long time or the id wrapped; drawing such a stripe avoids
- * wedging the row for up to half the id space.
- */
-const JPEG_STRIPE_REORDER_WINDOW = 256;
 let stripeDecodeSoftErrors = {};
 let wakeLockSentinel = null;
 let currentEncoderMode = 'h264enc-striped';
@@ -431,6 +467,7 @@ let appliedStreamDensity = 0;
 let reportedStreamDensity = 0;
 /** The last automatic request, as stream pixels and the CSS size it was built from. */
 let lastRequestedStreamRes = null;
+let lastSentManualResolution = null;
 /**
  * Hands the density to the input layer and, on a secondary whose density
  * moved with the primary's, requests the stream at it again.
@@ -457,7 +494,8 @@ const DPI_STOPS = [96, 120, 144, 168, 192, 216, 240, 264, 288];
  * @returns {number} The nearest entry of `DPI_STOPS`, clamped at both ends.
  */
 function autoDeriveDpi() {
-  const dpr = window.devicePixelRatio || 1;
+  // Policy hook (lib/stream-policy.js): the remote UI is sized for uiDensity(), not the device pixel ratio.
+  const dpr = uiDensity();
   const target = Math.round(dpr * 4) * 24;
   return DPI_STOPS.reduce((prev, cur) =>
     Math.abs(cur - target) < Math.abs(prev - target) ? cur : prev);
@@ -512,13 +550,20 @@ function applyEffectiveCursorSetting() {
     } catch (e) { /* postMessage unavailable */ }
 }
 /** Publishes the real viewport height as the `--vh` CSS unit (mobile browser chrome excluded). */
+// Tells the surrounding UI (Sidebar) the effective trackpad mode. Both names
+// are emitted: 'trackpadModeState' is the current contract, 'trackpadModeUpdate'
+// the legacy one.
+function postTrackpadModeState(enabled) {
+    window.postMessage({ type: 'trackpadModeState', enabled }, window.location.origin);
+    window.postMessage({ type: 'trackpadModeUpdate', enabled }, window.location.origin);
+}
 function setRealViewportHeight() {
   const vh = window.innerHeight * 0.01;
   document.documentElement.style.setProperty('--vh', `${vh}px`);
 }
 /** One id per multipart clipboard transfer. */
 let clipboardTransferCounter = 0;
-const clipboardWorker = new ClipboardWorkerBridge();
+let clipboardWorker = new ClipboardWorkerBridge();
 /**
  * PNG-normalizes an image on the worker, which is where the decode and
  * re-encode of a large one belong; the page's own canvas covers a worker that
@@ -548,6 +593,7 @@ const isChromium = (() => {
 
 const clipboardSync = createClipboardSync({
     isChromium,
+    syncState: pageClipboardSyncState,
     canRead: () => !!clipboard_in_enabled,
     sendRequest: () => {
         if (websocket && websocket.readyState === WebSocket.OPEN) {
@@ -602,9 +648,13 @@ const authToken = urlParams.get('token');
  * `#shared` and `#player2` to `#player4` are the shared-viewer roles.
  */
 const hash = window.location.hash;
-if (hash.startsWith('#display2')) {
+// Read as segments, never compared whole: a viewer bootstrap that rewrites the
+// URL leaves "#shared#shared" behind, and a page that missed its own hash
+// registers as the CONTROLLER and evicts the session's owner (lib/shared-mode.js).
+const display = displaySegment(hash);
+if (display) {
     displayId = 'display2';
-    const parts = hash.split('-');
+    const parts = display.split('-');
     if (parts.length > 1) {
         const position = parts[1];
         if (['left', 'right', 'up', 'down'].includes(position)) {
@@ -617,19 +667,10 @@ if (authToken) {
     isTokenAuthMode = true;
     console.log("Client is running in Token Authentication mode.");
 } else {
-    if (hash === '#shared') {
-        detectedSharedModeType = 'shared';
-        playerInputTargetIndex = undefined;
-    } else if (hash === '#player2') {
-        detectedSharedModeType = 'player2';
-        playerInputTargetIndex = 1;
-    } else if (hash === '#player3') {
-        detectedSharedModeType = 'player3';
-        playerInputTargetIndex = 2;
-    } else if (hash === '#player4') {
-        detectedSharedModeType = 'player4';
-        playerInputTargetIndex = 3;
-    }
+    // The page's own verdict wins over a hash read at an unlucky moment.
+    const role = readClientRole(hash, { forcedShared: pageSharedMode() });
+    detectedSharedModeType = role.sharedType ?? (role.role === 'viewer' ? 'shared' : null);
+    playerInputTargetIndex = role.inputTarget;
 }
 /** Shared-viewer handshake state: `idle`, `ready` or `error`. */
 let sharedClientState = 'idle';
@@ -658,20 +699,6 @@ window.onload = () => {
 
 const storageAppName = getStorageAppName();
 /**
- * localStorage write that degrades a full or unavailable store to a warning
- * instead of throwing QuotaExceededError into the caller.
- * @param {string} key
- * @param {string} value
- */
-const safeSetItem = (key, value) => {
-  try {
-    window.localStorage.setItem(key, value);
-  } catch (e) {
-    console.warn(`Selkies: could not persist '${key}' to localStorage:`, e);
-  }
-};
-
-/**
  * Storage key of the software-decode preference. A hardware H.264 decoder can
  * accept a config and then fail at decode(), which isConfigSupported cannot
  * predict, so the first hard decoder error retries the same encoder on
@@ -681,13 +708,7 @@ const safeSetItem = (key, value) => {
  * a new decoder stack) re-probes hardware.
  */
 const SOFTWARE_DECODE_KEY = `${storageAppName}_prefer_software_decode`;
-let preferSoftwareDecode = false;
-try {
-  preferSoftwareDecode =
-    window.localStorage.getItem(SOFTWARE_DECODE_KEY) === navigator.userAgent;
-} catch (e) {
-  console.warn('Selkies: could not read the software-decode preference:', e);
-}
+let preferSoftwareDecode = localStore.getItem(SOFTWARE_DECODE_KEY) === navigator.userAgent;
 /**
  * Whether the one software-decode retry of this session is spent. It is spent
  * whether or not the engine honoured the hint, so an engine that ignores it
@@ -709,14 +730,10 @@ const rememberSoftwareDecode = (enabled) => {
   }
   preferSoftwareDecode = enabled;
   if (enabled) {
-    safeSetItem(SOFTWARE_DECODE_KEY, navigator.userAgent);
+    localStore.setItem(SOFTWARE_DECODE_KEY, navigator.userAgent);
     return;
   }
-  try {
-    window.localStorage.removeItem(SOFTWARE_DECODE_KEY);
-  } catch (e) {
-    console.warn('Selkies: could not clear the software-decode preference:', e);
-  }
+  localStore.removeItem(SOFTWARE_DECODE_KEY);
 };
 /**
  * Applies the acceleration preference to a VideoDecoder config; every decoder
@@ -728,52 +745,35 @@ const rememberSoftwareDecode = (enabled) => {
 const decoderConfigFor = (config) =>
   preferSoftwareDecode ? { ...config, hardwareAcceleration: 'prefer-software' } : config;
 
-/**
- * Storage key of the decoder crash count the fallback ladder escalates on.
- * The count describes the current troubled stretch, not a lifetime total: a
- * session that decodes video for `HEALTHY_SESSION_MS` retires it, otherwise
- * unrelated faults months apart accumulate until the ladder pins jpeg.
- */
-const CRASH_COUNT_KEY = `${storageAppName}_crash_count`;
+/** Fatal decoder errors of this tab: after this many reloads, the next one marks the socket undecodable instead. */
+const DECODER_FATAL_KEY = `${storageAppName}_decoder_fatals`;
+const DECODER_FATAL_RELOADS = 1;
+/** A session that decodes video this long retires the tab's fatal count: a fault much later is a new one. */
 const HEALTHY_SESSION_MS = 60000;
-let crashCountRetired = false;
-/** Clears the crash count once this session has proven healthy; runs on every metrics tick. */
-const retireCrashCountWhenHealthy = () => {
-  if (crashCountRetired || isSharedMode) return;
+let decoderFatalsRetired = false;
+/** Clears the fatal count once this session has proven healthy; runs on every metrics tick. */
+const retireDecoderFatalsWhenHealthy = () => {
+  if (decoderFatalsRetired) return;
   if (!(window.fps > 0) || performance.now() < HEALTHY_SESSION_MS) return;
-  crashCountRetired = true;
-  try {
-    window.localStorage.removeItem(CRASH_COUNT_KEY);
-  } catch (e) {
-    console.warn('Selkies: could not clear the decoder crash count:', e);
-  }
+  decoderFatalsRetired = true;
+  sessionStore.removeItem(DECODER_FATAL_KEY);
 };
 
-document.title = 'Selkies';
-fetch('manifest.json')
-  .then(response => response.json())
-  .then(manifest => {
-    if (manifest.name) {
-      document.title = manifest.name;
-    }
-  })
-  .catch(() => {
-  });
 
-let framerate = 60;
-let video_crf = 25;
+let framerate = 25;
+let video_crf = 32;
 let video_fullcolor = false;
-let video_streaming_mode = false;
+let video_streaming_mode = true;
 let jpeg_quality = 60;
 let paint_over_jpeg_quality = 90;
 let use_cpu = false;
-let video_paintover_crf = 18;
+let video_paintover_crf = 25;
 let video_paintover_burst_frames = 5;
 let use_paint_over_quality = true;
-let audio_bitrate = 320000;
+let audio_bitrate = 128000;
 let videoBitrate = 8000;
 let force_aligned_resolution = false;
-let showStart = true;
+let showStart = false;
 let status = 'connecting';
 let loadingText = '';
 const gamepad = {
@@ -796,11 +796,14 @@ const networkStat = {
 };
 let debug = false;
 let streamStarted = false;
+let hasPaintedFrame = false;
 /**
  * Nudges the encoder with a few keyframe requests after the handshake until
  * the first frame lands; a freshly connected page has no keyframe loop of its own.
  */
 let firstFrameRecoveryTimer = null;
+/** Why this socket's video cannot be decoded here (`no-webcodecs`, `no-h264`), or null while it can. */
+let socketUndecodableReason = null;
 let inputInitialized = false;
 let scaleLocallyManual;
 window.fps = 0;
@@ -831,7 +834,7 @@ const getIntParam = (key, default_value) => {
   if (displayId === 'display2' && PER_DISPLAY_SETTINGS.includes(key)) {
     finalKey = `${prefixedKey}_${displayId}`;
   }
-  const value = window.localStorage.getItem(finalKey);
+  const value = localStore.getItem(finalKey);
   return (value === null || value === undefined) ? default_value : parseInt(value);
 };
 /** Float variant of getIntParam, for range settings with fractional bounds. */
@@ -841,7 +844,7 @@ const getFloatParam = (key, default_value) => {
   if (displayId === 'display2' && PER_DISPLAY_SETTINGS.includes(key)) {
     finalKey = `${prefixedKey}_${displayId}`;
   }
-  const value = window.localStorage.getItem(finalKey);
+  const value = localStore.getItem(finalKey);
   const parsed = parseFloat(value);
   return (value === null || value === undefined || isNaN(parsed)) ? default_value : parsed;
 };
@@ -853,9 +856,9 @@ const setIntParam = (key, value) => {
     finalKey = `${prefixedKey}_${displayId}`;
   }
   if (value === null || value === undefined) {
-    window.localStorage.removeItem(finalKey);
+    localStore.removeItem(finalKey);
   } else {
-    safeSetItem(finalKey, value.toString());
+    localStore.setItem(finalKey, value.toString());
   }
 };
 /** The localStorage key a setting is stored under, display suffix included. */
@@ -871,7 +874,7 @@ const getBoolParam = (key, default_value) => {
   if (displayId === 'display2' && PER_DISPLAY_SETTINGS.includes(key)) {
     finalKey = `${prefixedKey}_${displayId}`;
   }
-  const v = window.localStorage.getItem(finalKey);
+  const v = localStore.getItem(finalKey);
   if (v === null) {
     return default_value;
   }
@@ -885,9 +888,9 @@ const setBoolParam = (key, value) => {
     finalKey = `${prefixedKey}_${displayId}`;
   }
   if (value === null || value === undefined) {
-    window.localStorage.removeItem(finalKey);
+    localStore.removeItem(finalKey);
   } else {
-    safeSetItem(finalKey, value.toString());
+    localStore.setItem(finalKey, value.toString());
   }
 };
 /** Reads a string setting. */
@@ -897,7 +900,7 @@ const getStringParam = (key, default_value) => {
   if (displayId === 'display2' && PER_DISPLAY_SETTINGS.includes(key)) {
     finalKey = `${prefixedKey}_${displayId}`;
   }
-  const value = window.localStorage.getItem(finalKey);
+  const value = localStore.getItem(finalKey);
   return (value === null || value === undefined) ? default_value : value;
 };
 /** Stores a string setting; `null` removes the key. */
@@ -908,9 +911,9 @@ const setStringParam = (key, value) => {
     finalKey = `${prefixedKey}_${displayId}`;
   }
   if (value === null || value === undefined) {
-    window.localStorage.removeItem(finalKey);
+    localStore.removeItem(finalKey);
   } else {
-    safeSetItem(finalKey, value.toString());
+    localStore.setItem(finalKey, value.toString());
   }
 };
 /**
@@ -945,10 +948,10 @@ const setStringParam = (key, value) => {
  */
 function resolvedCssScaling(serverSettings) {
   const key = prefixedStorageKey('useCssScaling');
-  const explicit = window.localStorage.getItem(`${key}_explicit_choice`) === 'true';
+  const explicit = localStore.getItem(`${key}_explicit_choice`) === 'true';
   const hidpi = resolveSpec(HIDPI_SPEC, serverSettings,
     { manualActive: !!window.manual_resolution || manual_width > 0 },
-    () => (explicit ? window.localStorage.getItem(key) : null));
+    () => (explicit ? localStore.getItem(key) : null));
   return HIDPI_SPEC.toServer(hidpi);
 }
 
@@ -967,7 +970,8 @@ function sanitizeAndStoreSettings(serverSettings) {
     const setting = serverSettings[key];
     const storeKey = storageKeyForServerKey(key);
     const finalKey = storageKeyFor(storeKey);
-    const wasUnset = window.localStorage.getItem(finalKey) === null;
+    const wasUnset = localStore.getItem(finalKey) === null;
+    const previousValue = window[key];
 
     if (setting.min !== undefined && setting.max !== undefined) {
       const clientValue = getFloatParam(storeKey, setting.default);
@@ -975,7 +979,7 @@ function sanitizeAndStoreSettings(serverSettings) {
         window[key] = clientValue;
       } else if (clientValue < setting.min || clientValue > setting.max) {
         console.log(`Sanitizing '${key}': stored value ${clientValue} out of range [${setting.min}-${setting.max}]. Reverting to server default ${setting.default}.`);
-        window.localStorage.removeItem(finalKey);
+        localStore.removeItem(finalKey);
         window[key] = setting.default;
         changes[key] = setting.default;
       } else {
@@ -992,7 +996,7 @@ function sanitizeAndStoreSettings(serverSettings) {
         applyRuntime(setting.value);
       } else if (!setting.allowed.includes(clientValueStr)) {
         console.log(`Sanitizing '${key}': stored "${clientValueStr}" not in allowed [${setting.allowed.join(', ')}]. Reverting to server default "${setting.value}".`);
-        window.localStorage.removeItem(finalKey);
+        localStore.removeItem(finalKey);
         applyRuntime(setting.value);
         changes[key] = setting.value;
       } else {
@@ -1004,15 +1008,16 @@ function sanitizeAndStoreSettings(serverSettings) {
     else if (typeof setting.value === 'boolean') {
       const serverValue = setting.value;
       if (setting.locked) {
-        const clientValue = getBoolParam(storeKey, !serverValue);
-        if (clientValue !== serverValue) {
+        const clientValue = getBoolParam(storeKey, serverValue);
+        if (previousValue !== serverValue || (!wasUnset && clientValue !== serverValue)) {
           console.log(`Sanitizing '${key}': setting is locked by server. Client value ${clientValue} is being overwritten with ${serverValue}.`);
           changes[key] = serverValue;
+          if (!wasUnset && clientValue !== serverValue) localStore.removeItem(finalKey);
         }
         window[key] = serverValue;
       } else if (wasUnset) {
         window[key] = serverValue;
-        if (setting.overridden) {
+        if (setting.overridden && previousValue !== serverValue) {
           changes[key] = serverValue;
         }
       } else {
@@ -1039,13 +1044,15 @@ video_paintover_burst_frames = getIntParam('video_paintover_burst_frames', video
 use_paint_over_quality = getBoolParam('use_paint_over_quality', use_paint_over_quality);
 audio_bitrate = getIntParam('audio_bitrate', audio_bitrate);
 debug = getBoolParam('debug', debug);
+// Older builds pinned `jpeg` after a decoder refusal; this core paints H.264 only.
+if (getStringParam('encoder', null) === 'jpeg') setStringParam('encoder', null);
 currentEncoderMode = getStringParam('encoder', 'h264enc');
 webcamEncoderPreference = getStringParam('webcam_encoder', 'auto');
 scaleLocallyManual = getBoolParam('scaleLocallyManual', true);
 window.manual_resolution = getBoolParam('manual_resolution', false);
 isGamepadEnabled = getBoolParam('isGamepadEnabled', true);
 useCssScaling = getBoolParam('useCssScaling', false);
-trackpadMode = getBoolParam('trackpadMode', false);
+trackpadMode = getBoolParam('trackpadMode', window.matchMedia?.('(pointer: coarse)').matches ?? false);
 rateControlMode = getStringParam('rate_control_mode', rateControlMode);
 videoBitrate = getIntParam('video_bitrate', videoBitrate);
 if (getStringParam('scaling_dpi', null) === null) {
@@ -1067,6 +1074,27 @@ if (isSharedMode) {
 } else {
     manual_width = getIntParam('manual_width', null);
     manual_height = getIntParam('manual_height', null);
+    // Policy hook (lib/stream-policy.js): a first visit on a small screen starts in a manual resolution.
+    const smallScreen = smallScreenDefault({
+        shared: isSharedMode || displayId === 'display2',
+        storageAppName,
+        screenWidth: (window.screen && window.screen.width) || 0,
+        screenHeight: (window.screen && window.screen.height) || 0,
+    });
+    if (smallScreen) {
+        window.manual_resolution = true;
+        manual_width = smallScreen.width;
+        manual_height = smallScreen.height;
+        setBoolParam('manual_resolution', true);
+        setIntParam('manual_width', manual_width);
+        setIntParam('manual_height', manual_height);
+        console.log(`Small screen: defaulting to ${manual_width}x${manual_height} manual resolution.`);
+    } else if (smallScreen === false) {
+        window.manual_resolution = false;
+        manual_width = null;
+        manual_height = null;
+        console.log('Small screen pick released: automatic resolution.');
+    }
 }
 
 /**
@@ -1157,7 +1185,7 @@ let USE_OFFSCREEN_WORKER = false;
 let videoWorker = null;
 /**
  * Canvas the worker composites on in `canvas` mode; separate from the main
- * canvas so the JPEG-stripe path is unaffected.
+ * canvas so the page path is unaffected.
  */
 let videoWorkerCanvas = null;
 /** Composite striped-codec stripes in the worker; capability-gated at first use. */
@@ -1191,16 +1219,21 @@ let decodeInWorker = false;
 let workerDecoderCodec = null, workerDecoderW = 0, workerDecoderH = 0;
 let workerKeyframeCodec = null;
 let workerDecodeFailed = false;
-// Whether 0x03/0x04 currently bypass the page (see updateVideoDivert), and
+// Whether 0x04 currently bypasses the page (see updateVideoDivert), and
 // the wire frames the video worker counted since the last metrics tick.
 let videoDivertOn = false;
 /** Whether the running divert is the striped one, which acks presented ids. */
 let videoDivertStriped = false;
 let divertedWireFramesThisPeriod = 0;
 /** What the worker reported it can decode, for the striped divert gates. */
-let videoWorkerStripedDecode = false, videoWorkerJpegDecode = false;
-/** Worker spawns attempted, capping respawn churn where Worker() cannot run. */
-let videoWorkerSpawnAttempts = 0;
+let videoWorkerStripedDecode = false;
+/**
+ * Video workers built since one last presented a frame. At the cap none is
+ * built again, so a worker that keeps crashing or losing its sink cannot turn
+ * into a respawn loop; only a presented frame resets it, never the handshake.
+ */
+let videoWorkerSpawnsUnpresented = 0;
+const VIDEO_WORKER_MAX_SPAWNS_UNPRESENTED = 3;
 /**
  * A transferred canvas whose element never mirrors the worker's committed
  * size is a placeholder nothing will ever display (Playwright's WebKit);
@@ -1303,13 +1336,22 @@ function present(f) {
     }
     sinkDrops = 0;
     // write() consumes/closes f on success; on reject (writable errored) it does NOT, so close it here to avoid leaking the frame.
-    writer.write(f).catch(() => { try { f.close(); } catch (_) {} closed = true; self.postMessage({ type: 'error' }); });
+    const activeWriter = writer;
+    writer.write(f).then(() => {
+      if (closed || writer !== activeWriter) return;
+      presentedFrames++;
+      if (!presented) { presented = true; self.postMessage({ type: 'presented' }); }
+    }).catch(() => {
+      try { f.close(); } catch (_) {}
+      if (!closed && writer === activeWriter) { closed = true; self.postMessage({ type: 'error' }); }
+    });
     return;
   }
   try {
     if (ctx) {
       if (oc.width !== f.displayWidth || oc.height !== f.displayHeight) { oc.width = f.displayWidth; oc.height = f.displayHeight; }
       ctx.drawImage(f, 0, 0);
+      presentedFrames++;
       // Tell the page the OffscreenCanvas has real content so it can hide the
       // main canvas (hiding it before this point flashes black).
       if (!presented) { presented = true; self.postMessage({ type: 'presented' }); }
@@ -1361,19 +1403,22 @@ function decodeChunk(key, data, timestamp) {
 // counters, watchdogs and fps, with the row layout this side is decoding.
 let wireCodec = null, wireW = 0, wireH = 0, wireHint = null, wireSoftware = false;
 let wireChunks = 0, wireFrames = 0, wireLastId = -1, wireStatsTimer = null;
+function noteWire(frameId) {
+  wireChunks++;
+  if (frameId !== wireLastId) { wireFrames++; wireLastId = frameId; }
+}
 const parseAvcCodecFromAnnexB = ${parseAvcCodecFromAnnexB.toString()};
 
-// The striped modes (h264enc-striped, jpeg) decode, composite and present in
-// here: a VideoDecoder per row offset or an in-worker JPEG decode, drawn onto
+// The striped mode (h264enc-striped) decodes, composites and presents in
+// here: a VideoDecoder per row offset, drawn onto
 // a persistent back-buffer so undamaged rows survive, presented by the page's
 // rule -- last row landed, or the socket and decoders proven quiet (the
 // stripe clock), else at the frame-id boundary -- with the presented id going
 // back over the wire port so the server paces against what reached the screen.
 const createStripeClock = ${createStripeClock.toString()};
 const STRIPE_DECODE_QUEUE_LIMIT = ${STRIPE_DECODE_QUEUE_LIMIT};
-const JPEG_STRIPE_REORDER_WINDOW = ${JPEG_STRIPE_REORDER_WINDOW};
 let stripedOn = false, wirePort = null;
-let stripeDecs = {}, jpegLastRowId = {}, jpegRowHeights = {}, jpegPending = 0;
+let stripeDecs = {};
 let stripeBack = null, stripeBackCtx = null;
 let stripeGeomW = 0, stripeGeomH = 0, stripeGeomKnown = false;
 let stripePendingId = null, stripeDirty = false, stripeBottom = false;
@@ -1386,7 +1431,7 @@ function closeStripeState() {
     const info = stripeDecs[y];
     try { if (info.dec.state !== 'closed') info.dec.close(); } catch (err) {}
   }
-  stripeDecs = {}; jpegLastRowId = {}; jpegRowHeights = {}; jpegPending = 0;
+  stripeDecs = {};
   stripePendingId = null; stripeDirty = false; stripeBottom = false;
   if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
 }
@@ -1408,7 +1453,6 @@ function stripeEnsureBack(minW, minH) {
 }
 
 function stripeDrained() {
-  if (jpegPending > 0) return false;
   for (const y in stripeDecs) { if (stripeDecs[y].meta.length > 0) return false; }
   return true;
 }
@@ -1416,7 +1460,6 @@ function stripeDrained() {
 function stripePresent() {
   if (!stripeBack || !stripeDirty) return;
   stripeDirty = false; stripeBottom = false;
-  presentedFrames++;
   if (stripePendingId !== null && wirePort) {
     try { wirePort.postMessage({ presentedId: stripePendingId }); } catch (err) {}
   }
@@ -1436,7 +1479,8 @@ function stripePresent() {
     if (oc.width !== stripeBack.width || oc.height !== stripeBack.height) {
       oc.width = stripeBack.width; oc.height = stripeBack.height;
     }
-    try { ctx.drawImage(stripeBack, 0, 0); } catch (err) {}
+    try { ctx.drawImage(stripeBack, 0, 0); } catch (err) { return; }
+    presentedFrames++;
     if (!presented) { presented = true; self.postMessage({ type: 'presented' }); }
   }
 }
@@ -1500,8 +1544,7 @@ function onH264Stripe(buffer) {
   const y = (head[4] << 8) | head[5];
   const w = (head[6] << 8) | head[7];
   const h = (head[8] << 8) | head[9];
-  wireChunks++;
-  if (frameId !== wireLastId) { wireFrames++; wireLastId = frameId; }
+  noteWire(frameId);
   stripeClock.note(frameId);
   const payload = buffer.slice(10);
   if (payload.byteLength === 0) return;
@@ -1554,52 +1597,11 @@ function onH264Stripe(buffer) {
   }
 }
 
-function onJpegStripe(buffer) {
-  if (buffer.byteLength < 7) return;
-  const head = new Uint8Array(buffer, 0, 6);
-  const frameId = (head[2] << 8) | head[3];
-  const y = (head[4] << 8) | head[5];
-  wireChunks++;
-  if (frameId !== wireLastId) { wireFrames++; wireLastId = frameId; }
-  stripeClock.note(frameId);
-  const data = buffer.slice(6);
-  if (data.byteLength === 0) return;
-  const done = (image) => {
-    jpegPending--;
-    if (!image) { stripeMaybePresent(); return; }
-    const last = jpegLastRowId[y];
-    if (last !== undefined) {
-      const behindBy = (last - frameId) & 0xFFFF;
-      if (behindBy > 0 && behindBy <= JPEG_STRIPE_REORDER_WINDOW) {
-        try { image.close(); } catch (err) {}
-        stripeMaybePresent();
-        return;
-      }
-    }
-    jpegLastRowId[y] = frameId;
-    const h = image.displayHeight !== undefined ? image.displayHeight : image.height;
-    jpegRowHeights[y] = h;
-    stripeCompose(image, y, h, frameId);
-  };
-  if (typeof ImageDecoder !== 'undefined') {
-    let d = null;
-    try { d = new ImageDecoder({ data: data, type: 'image/jpeg' }); }
-    catch (err) { return; }
-    jpegPending++;
-    d.decode().then((r) => { try { d.close(); } catch (err) {} done(r.image); })
-      .catch(() => { try { d.close(); } catch (err) {} done(null); });
-  } else if (typeof createImageBitmap === 'function') {
-    jpegPending++;
-    createImageBitmap(new Blob([data], { type: 'image/jpeg' })).then(done).catch(() => done(null));
-  }
-}
-
 function onWire(buffer) {
   if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 1) return;
   if (stripedOn) {
     const type = new Uint8Array(buffer, 0, 1)[0];
-    if (type === 0x03) onJpegStripe(buffer);
-    else if (type === 0x04) onH264Stripe(buffer);
+    if (type === 0x04 && stripedCaps.stripedDecode) onH264Stripe(buffer);
     return;
   }
   if (buffer.byteLength < 11) return;
@@ -1608,8 +1610,7 @@ function onWire(buffer) {
   const frameId = (head[2] << 8) | head[3];
   const w = (head[6] << 8) | head[7];
   const h = (head[8] << 8) | head[9];
-  wireChunks++;
-  if (frameId !== wireLastId) { wireFrames++; wireLastId = frameId; }
+  noteWire(frameId);
   const payload = buffer.slice(10);
   let codec = wireCodec;
   if (key) {
@@ -1630,7 +1631,6 @@ function onWire(buffer) {
 
 const stripedCaps = {
   stripedDecode: typeof VideoDecoder !== 'undefined',
-  jpegDecode: typeof ImageDecoder !== 'undefined' || typeof createImageBitmap === 'function',
 };
 if (typeof VideoTrackGenerator !== 'undefined') {
   try {
@@ -1664,7 +1664,6 @@ self.onmessage = (e) => {
         const rows = {};
         if (stripedOn) {
           for (const y in stripeDecs) rows[y] = stripeDecs[y].h;
-          for (const y in jpegRowHeights) if (!(y in rows)) rows[y] = jpegRowHeights[y];
         } else if (dec && wireH > 0) {
           rows[0] = wireH;
         }
@@ -1693,7 +1692,6 @@ self.onmessage = (e) => {
         // A real geometry change; the server keyframes it, so stale rows go.
         stripeBack = null; stripeBackCtx = null;
         stripeDirty = false; stripePendingId = null;
-        jpegLastRowId = {}; jpegRowHeights = {};
       }
     }
     stripeGeomKnown = stripeGeomKnown || know;
@@ -1748,7 +1746,7 @@ function ensureMstgWriter() {
   try { videoElement.srcObject = new MediaStream([videoTrack]); }
   catch (e) {
     console.warn('srcObject failed:', e);
-    try { videoFrameWriter.close(); } catch (_) {} videoFrameWriter = null;
+    closeTrackWriter(videoFrameWriter); videoFrameWriter = null;
     try { videoTrack.stop(); } catch (_) {} videoTrack = null;
     return false;
   }
@@ -1756,9 +1754,14 @@ function ensureMstgWriter() {
   return true;
 }
 
+/** Closes a track writer; on an errored stream close() rejects rather than throws. */
+function closeTrackWriter(writer) {
+  try { writer.close().catch(() => {}); } catch (e) { /* lock already released */ }
+}
+
 /** Closes the track generator writer and detaches its stream from the `<video>`. */
 function teardownMstgWriter() {
-  if (videoFrameWriter) { try { videoFrameWriter.close(); } catch (e) {} videoFrameWriter = null; }
+  if (videoFrameWriter) { closeTrackWriter(videoFrameWriter); videoFrameWriter = null; }
   if (videoTrack) { try { videoTrack.stop(); } catch (e) {} videoTrack = null; }
   if (videoElement) { try { videoElement.srcObject = null; } catch (e) {} }
 }
@@ -1790,7 +1793,7 @@ function presentFrameToVideo(frame) {
     }
     if (videoElement) {
       videoElement.style.display = 'block';
-      videoElement.style.objectFit = 'fill';
+      videoElement.style.objectFit = sinkObjectFit();
       if (typeof videoElement.requestVideoFrameCallback === 'function') {
         const gen = ++sinkRevealGen;
         videoElement.requestVideoFrameCallback(() => {
@@ -1810,7 +1813,7 @@ function presentFrameToVideo(frame) {
       mstgLastGeom = canvas.style.cssText;
       videoElement.style.cssText = mstgLastGeom;
       videoElement.style.display = 'block';
-      videoElement.style.objectFit = 'fill';
+      videoElement.style.objectFit = sinkObjectFit();
       canvasGeomDirty = false;
     }
   }
@@ -1827,7 +1830,9 @@ function presentFrameToVideo(frame) {
   }
   mstgConsecutiveDrops = 0;
   const activeWriter = videoFrameWriter;
-  videoFrameWriter.write(frame).catch(() => {
+  videoFrameWriter.write(frame).then(() => {
+    if (!viewerCoreStopped && videoFrameWriter === activeWriter) markFramePainted();
+  }).catch(() => {
     try { frame.close(); } catch (e) {}
     if (videoFrameWriter === activeWriter) deactivateMstg();
   });
@@ -1882,11 +1887,10 @@ function wireSocketToVideoWorker() {
  * @returns {void}
  */
 function updateVideoDivert(force) {
-  const striped = currentEncoderMode === 'h264enc-striped' || currentEncoderMode === 'jpeg';
-  const stripedReady = USE_OFFSCREEN_WORKER && videoWorkerReady &&
-    (currentEncoderMode === 'jpeg' ? videoWorkerJpegDecode : videoWorkerStripedDecode);
+  const striped = currentEncoderMode === 'h264enc-striped';
+  const stripedReady = USE_OFFSCREEN_WORKER && videoWorkerReady && videoWorkerStripedDecode;
   const on = !!(websocket && typeof websocket.setVideoDivert === 'function' &&
-    videoWorkerReady && !workerDecodeFailed &&
+    socketUndecodableReason === null && videoWorkerReady && !workerDecodeFailed &&
     (striped ? stripedReady : (decodeInWorker && currentEncoderMode === 'h264enc')));
   if (videoWorker) {
     try { videoWorker.postMessage({ type: 'wireMode', striped }); } catch (e) { /* respawns fresh */ }
@@ -1908,7 +1912,7 @@ function updateVideoDivert(force) {
       // The worker decodes now; page-built row decoders would only sit
       // configured behind it until the next resize or reconnect.
       clearAllVncStripeDecoders();
-      cleanupJpegStripeQueue();
+      clearDecodedStripesQueue();
     }
     syncWireGeom();
     activateWorkerSinkDisplay();
@@ -1947,24 +1951,32 @@ function ensureVideoWorker() {
   if (videoWorkerSinkInert) return false;
   if (videoWorkerReady) return true;
   if (videoWorker) return false;
+  if (videoWorkerSpawnsUnpresented >= VIDEO_WORKER_MAX_SPAWNS_UNPRESENTED) return false;
   try {
     // The Worker keeps its own reference to the script, so the object URL is
     // revoked at once rather than living until the page unloads.
     const workerURL = URL.createObjectURL(new Blob([VIDEO_WORKER_SRC], { type: 'text/javascript' }));
-    videoWorkerSpawnAttempts++;
+    videoWorkerSpawnsUnpresented++;
     videoWorker = new Worker(workerURL);
     URL.revokeObjectURL(workerURL);
     videoWorkerInFlight = 0;
     wireSocketToVideoWorker();
-    videoWorker.onerror = (e) => { console.warn('video worker error:', e && e.message); deactivateVideoWorker(); };
+    videoWorker.onerror = (e) => {
+      // Cancelled: an uncancelled worker error is raised again on the page.
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      console.warn('video worker error:', e && e.message);
+      deactivateVideoWorker();
+    };
     videoWorker.onmessage = (e) => {
       const m = e.data;
       if (!m) return;
       if (m.ack) { if (videoWorkerInFlight > 0) videoWorkerInFlight--; return; }
       if (m.type === 'error') { deactivateVideoWorker(); return; }
       if (m.type === 'presented') {
+        videoWorkerSpawnsUnpresented = 0;
         videoWorkerRendered = true;
         if (videoWorkerActive && canvas) canvas.style.display = 'none';
+        markFramePainted();
         return;
       }
       if (m.type === 'needKeyframe') {
@@ -1981,7 +1993,7 @@ function ensureVideoWorker() {
       }
       if (m.type === 'wireStats') {
         window.videoChunksReceived += m.chunks;
-        const stripedNow = currentEncoderMode === 'h264enc-striped' || currentEncoderMode === 'jpeg';
+        const stripedNow = currentEncoderMode === 'h264enc-striped';
         // Striped fps means composites presented, exactly as on the page path;
         // full-frame rate stays a wire measure.
         if (stripedNow) frameCount += (m.presents || 0);
@@ -1989,7 +2001,7 @@ function ensureVideoWorker() {
         if (m.lastId >= 0) { lastReceivedVideoFrameId = m.lastId; lastReceivedVideoFrameAt = performance.now(); }
         if (m.rows) window.videoStripeRows = m.rows;
         if (isSharedMode && m.chunks > 0) lastSharedVideoChunkTime = performance.now();
-        if (!streamStarted && (m.frames > 0 || (m.presents || 0) > 0)) startStream();
+        if ((m.presents || 0) > 0) markFramePainted();
         if (videoDivertOn) {
           activateWorkerSinkDisplay();
           checkWorkerSinkAlive();
@@ -2010,7 +2022,6 @@ function ensureVideoWorker() {
       }
       if (m.type === 'mode') {
         videoWorkerStripedDecode = !!m.stripedDecode;
-        videoWorkerJpegDecode = !!m.jpegDecode;
         if (m.mode === 'vtg' && m.track) {
           if (!videoElement) { deactivateVideoWorker(); return; }
           videoWorkerMode = 'vtg';
@@ -2022,14 +2033,12 @@ function ensureVideoWorker() {
           announceSink('VideoTrackGenerator in the video worker.');
           decodeInWorker = true;
           videoWorkerReady = true;
-          videoWorkerSpawnAttempts = 0;
           syncWireGeom();
           updateVideoDivert();
-        } else if (supportsWindowMSTG &&
-            currentEncoderMode !== 'h264enc-striped' && currentEncoderMode !== 'jpeg') {
+        } else if (supportsWindowMSTG && currentEncoderMode !== 'h264enc-striped') {
           // No worker generator, but the page has one: it feeds a <video>
           // element, which beats compositing a canvas by hand.
-          announceSink('MediaStreamTrackGenerator on the page — '
+          announceSink('MediaStreamTrackGenerator on the page - '
             + 'this browser exposes no VideoTrackGenerator to a worker.');
           deactivateVideoWorker();
           return;
@@ -2038,7 +2047,7 @@ function ensureVideoWorker() {
           announceSink(supportsWindowMSTG
             ? 'OffscreenCanvas in the video worker for the striped '
               + 'codecs; full-frame H.264 presents through the page MediaStreamTrackGenerator.'
-            : 'OffscreenCanvas in the video worker — '
+            : 'OffscreenCanvas in the video worker - '
               + 'this browser exposes no VideoTrackGenerator to a worker and no '
               + 'MediaStreamTrackGenerator on the page, so frames are composited rather '
               + 'than handed to a <video> element.');
@@ -2052,7 +2061,6 @@ function ensureVideoWorker() {
           // full-frame decode stays on the page feeding that generator.
           decodeInWorker = !supportsWindowMSTG;
           videoWorkerReady = true;
-          videoWorkerSpawnAttempts = 0;
           syncWireGeom();
           updateVideoDivert();
         }
@@ -2079,11 +2087,11 @@ function deactivateVideoWorker() {
   const wasVtg = (videoWorkerMode === 'vtg');
   announceSink(supportsWindowMSTG
     ? 'MediaStreamTrackGenerator on the page.'
-    : '2D canvas on the page — no video worker sink.');
+    : '2D canvas on the page - no video worker sink.');
   const wasTransferred = videoWorkerCanvasTransferred;
   videoWorkerActive = false; videoWorkerReady = false; videoWorkerMode = null;
   decodeInWorker = false;
-  videoWorkerStripedDecode = false; videoWorkerJpegDecode = false;
+  videoWorkerStripedDecode = false;
   workerSinkInertSince = 0;
   updateVideoDivert();
   videoWorkerInFlight = 0; videoWorkerCanvasTransferred = false;
@@ -2128,7 +2136,7 @@ function activateWorkerSinkDisplay() {
       if (mstgActive) deactivateMstg();
       else if (videoElement) videoElement.style.display = 'none';
     }
-    target.style.display = 'block'; target.style.objectFit = 'fill';
+    target.style.display = 'block'; target.style.objectFit = sinkObjectFit();
     if (videoWorkerMode === 'vtg') {
       if (typeof target.requestVideoFrameCallback === 'function') {
         const gen = ++sinkRevealGen;
@@ -2149,7 +2157,7 @@ function activateWorkerSinkDisplay() {
       videoWorkerLastGeom = canvas.style.cssText;
       target.style.cssText = videoWorkerLastGeom;
       target.style.display = 'block';
-      target.style.objectFit = 'fill';
+      target.style.objectFit = sinkObjectFit();
       canvasGeomDirty = false;
     }
   }
@@ -2329,18 +2337,113 @@ const updateCanvasImageRendering = () => {
   }
 };
 
+// Browsers gate audible playback behind a user gesture: a context created
+// before the first gesture starts 'suspended', and iOS Safari only honours
+// resume() called synchronously inside a gesture handler; iOS can also flip a
+// running context to the non-standard 'interrupted' state and suspend it when
+// the tab backgrounds. The stream socket keeps delivering Opus regardless, so
+// without an explicit unlock those platforms decode into a context that never
+// runs and the session is silently mute.
+// Backoff so a failing initializeAudio() (an AudioWorklet load error, say) is
+// retried every few seconds instead of once per audio packet.
+let lastAudioInitAttemptMs = 0;
+const AUDIO_INIT_RETRY_MS = 3000;
+let audioUnlockListenersAttached = false;
+let audioResumeInFlight = false;
+const AUDIO_UNLOCK_EVENTS = ['pointerdown', 'touchend', 'keydown'];
+
+function tryResumeAudioContext(trigger) {
+  if (!audioContext) return;
+  const state = audioContext.state;
+  if (state === 'running' || state === 'closed') return;
+  if (audioResumeInFlight) return;
+  audioResumeInFlight = true;
+  audioContext.resume().then(() => {
+    audioResumeInFlight = false;
+    if (audioContext && audioContext.state === 'running') {
+      console.log(`Playback AudioContext resumed (${trigger}).`);
+    }
+  }).catch((e) => {
+    audioResumeInFlight = false;
+    // Expected before the first gesture on iOS/Android; the unlock listeners
+    // stay armed and retry from inside a gesture.
+    console.log(`Playback AudioContext resume blocked (${trigger}): ${e && e.message}`);
+  });
+}
+
+function handleAudioUnlockGesture() {
+  // Runs synchronously inside a genuine gesture, the only place iOS Safari
+  // accepts a resume(). The one-sample silent buffer is the long-standing
+  // WebKit unlock idiom, opening the hardware route when resume() alone is
+  // ignored.
+  if (audioContext && audioContext.state !== 'running' && audioContext.state !== 'closed') {
+    audioContext.resume().catch(() => {});
+    try {
+      const silent = audioContext.createBuffer(1, 1, audioContext.sampleRate);
+      const src = audioContext.createBufferSource();
+      src.buffer = silent;
+      src.connect(audioContext.destination);
+      src.start(0);
+    } catch (e) { /* the nudge is best-effort */ }
+  }
+  if (micAudioContext && micAudioContext.state === 'suspended') {
+    micAudioContext.resume().catch(() => {});
+  }
+  const video = document.getElementById('videoStream');
+  if (video && video.muted) {
+    video.muted = false;
+    video.play().catch(() => {});
+  }
+  if (audioContext && audioContext.state === 'running') detachAudioUnlockListeners();
+}
+
+function attachAudioUnlockListeners() {
+  if (audioUnlockListenersAttached) return;
+  audioUnlockListenersAttached = true;
+  AUDIO_UNLOCK_EVENTS.forEach((evt) => {
+    lifecycle.listen(document, evt, handleAudioUnlockGesture, { capture: true, passive: true });
+  });
+}
+
+function detachAudioUnlockListeners() {
+  if (!audioUnlockListenersAttached) return;
+  audioUnlockListenersAttached = false;
+  AUDIO_UNLOCK_EVENTS.forEach((evt) => {
+    document.removeEventListener(evt, handleAudioUnlockGesture, { capture: true });
+  });
+}
+
+// Programmatic re-resume for contexts the OS suspended behind our back (tab
+// return, bfcache restore, end of an iOS audio interruption). Once the page
+// has seen any gesture these succeed without a new one.
+let audioLifecycleListenersAttached = false;
+function handleAudioLifecycleResume() {
+  if (document.visibilityState === 'hidden') return;
+  tryResumeAudioContext('lifecycle');
+}
+function attachAudioLifecycleListeners() {
+  if (audioLifecycleListenersAttached) return;
+  audioLifecycleListenersAttached = true;
+  lifecycle.listen(document, 'visibilitychange', handleAudioLifecycleResume);
+  lifecycle.listen(window, 'pageshow', handleAudioLifecycleResume);
+  lifecycle.listen(window, 'focus', handleAudioLifecycleResume);
+}
+function detachAudioLifecycleListeners() {
+  if (!audioLifecycleListenersAttached) return;
+  audioLifecycleListenersAttached = false;
+  document.removeEventListener('visibilitychange', handleAudioLifecycleResume);
+  window.removeEventListener('pageshow', handleAudioLifecycleResume);
+  window.removeEventListener('focus', handleAudioLifecycleResume);
+}
+
 /** Installs the page's base stylesheet: the video container, its sinks, the overlay input and the start button. */
 const injectCSS = () => {
+  ownedStyle?.remove();
   const style = document.createElement('style');
+  ownedStyle = style;
   style.textContent = `
-body {
-  font-family: sans-serif;
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
-  background-color: #000;
-  color: #fff;
-}
+  /* The app shell owns body styling. */
+
 #app {
   display: flex;
   flex-direction: column;
@@ -2368,10 +2471,10 @@ body {
     width: 100%;
     height: 100%;
 }
-.video-container video {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
+/* Upgrade hook (transport.ts): keep the pending peer's video displayed. */
+.video-container #videoStream {
+  /* No max-width/height: the box may overlap the stage by a pixel (fitStreamBox). */
+  object-fit: cover;
   display: none;
 }
 .video-container #videoCanvas {
@@ -2403,17 +2506,10 @@ body {
   display: none !important;
 }
 .video-container .status-bar {
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  width: 100%;
-  padding: 5px;
-  background-color: rgba(0, 0, 0, 0.7);
-  color: #fff;
-  text-align: center;
-  z-index: 5;
+  display: none !important;
 }
 #playButton {
+  display: none !important;
   padding: 15px 30px;
   font-size: 1.5em;
   cursor: pointer;
@@ -2448,43 +2544,24 @@ async function settleFullColorSupport() {
     setBoolParam('video_fullcolor', false);
 }
 
-let codecRefusalAnswered = false;
-let codecRefusalUnanswerable = false;
 /**
- * Answers a decoder config this engine will not take, and reports it.
- *
- * The codec is the stream's own, read from the keyframe's SPS, so it is what
- * the server is really sending rather than what the settings say: a
- * `video_fullcolor` the server holds locked arrives as 4:4:4 in the bitstream
- * and as nothing at all in the settings echo. Left alone, every stripe of
- * every frame builds a decoder and has it refused, and the page stays black
- * without saying why.
- *
- * A client that owns its settings takes the ladder's own last rung, the JPEG
- * encoder, whose stripes need no `VideoDecoder`. Refusals that outlive that
- * switch -- a decoder refused again, or an H.264 keyframe still arriving on
- * the page path -- mean the server holds the encoder too, and a shared viewer
- * owns none of the stream's settings to begin with: both are told, once.
+ * A decoder config this engine refuses for the stream's own codec (read from the keyframe's SPS).
+ * A refused config that carried the stored software-decode hint only drops the hint and rebuilds the
+ * decoders, once however many decoders were refused with it; a refusal without the hint means nothing
+ * on this socket can show the session, so it is marked undecodable.
  * @param {string} codec The refused codec string.
+ * @param {boolean} hinted The refused config asked for software decode.
  */
-function answerRefusedCodec(codec) {
-    if (codecRefusalUnanswerable) return;
-    if (!codecRefusalAnswered) {
-        codecRefusalAnswered = true;
-        if (!isSharedMode && currentEncoderMode !== 'jpeg') {
-            console.warn(`This browser has no decoder for ${codec}; switching to the JPEG encoder.`);
-            pinJpegEncoder();
-            sendFullSettingsUpdateToServer(`no decoder for ${codec}`);
-            return;
-        }
+function answerRefusedCodec(codec, hinted) {
+    if (socketUndecodableReason !== null) return;
+    if (hinted) {
+        if (!preferSoftwareDecode) return;
+        console.warn(`This browser refuses ${codec} on software decode; trying its default decoder.`);
+        rememberSoftwareDecode(false);
+        restartDecoders();
+        return;
     }
-    codecRefusalUnanswerable = true;
-    console.error(`This session streams ${codec}, which this browser cannot decode.`);
-    if (statusDisplayElement) {
-        statusDisplayElement.textContent = 'Error: This session streams video in a format this '
-            + 'browser cannot decode. Full color (4:4:4) needs a browser whose decoder has that profile.';
-        statusDisplayElement.classList.remove('hidden');
-    }
+    markSocketUndecodable('no-h264', codec);
 }
 
 /**
@@ -2519,7 +2596,8 @@ function currentDisplayScale(dpr) {
                        document.getElementById('videoWorkerCanvas')];
         for (const el of sinks) {
             const r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-            if (r && r.width > 0) return canvas.width / r.width;
+            // A letterboxed stream keeps the stage box (`object-fit: contain`): the picture spans the larger ratio.
+            if (r && r.width > 0 && r.height > 0) return Math.max(canvas.width / r.width, canvas.height / r.height);
         }
     }
     return dpr;
@@ -2545,7 +2623,7 @@ function getCurrentSettingsPayload() {
         if (displayId === 'display2' && PER_DISPLAY_SETTINGS.includes(key)) {
             finalKey = `${finalKey}_${displayId}`;
         }
-        return window.localStorage.getItem(finalKey) !== null;
+        return localStore.getItem(finalKey) !== null;
     };
     const storedEntries = [
         ['framerate', () => getIntParam('framerate', 60)],
@@ -2571,9 +2649,6 @@ function getCurrentSettingsPayload() {
         if (hasStoredParam(key)) settingsToSend[key] = read();
     }
     settingsToSend['scaling_dpi'] = scalingDPI;
-    if (detectedKeyboardLayout) {
-        settingsToSend['keyboardLayout'] = detectedKeyboardLayout;
-    }
     if (window.manual_resolution && manual_width != null && manual_height != null) {
         settingsToSend['manual_resolution'] = true;
         settingsToSend['manual_width'] = alignResolution(manual_width);
@@ -2582,7 +2657,7 @@ function getCurrentSettingsPayload() {
         const videoContainer = document.querySelector('.video-container');
         const rect = videoContainer ? videoContainer.getBoundingClientRect() : { width: window.innerWidth, height: window.innerHeight };
         settingsToSend['manual_resolution'] = false;
-        
+
         let initW = alignResolution(rect.width * dpr);
         let initH = alignResolution(rect.height * dpr);
         if (initW > 4080) initW = 4080;
@@ -2668,6 +2743,11 @@ function sendResolutionToServer(width, height) {
   console.log(`Sending resolution to server: ${resString}, DisplayID: ${displayId}, Manual Mode: ${window.manual_resolution}, Pixel Ratio Used: ${dprUsed}, useCssScaling: ${useCssScaling}`);
 
   if (websocket && websocket.readyState === WebSocket.OPEN) {
+    const manualResolution = Boolean(window.manual_resolution);
+    if (lastSentManualResolution !== manualResolution) {
+      websocket.send(`SETTINGS,${JSON.stringify({manual_resolution: manualResolution})}`);
+      lastSentManualResolution = manualResolution;
+    }
     websocket.send(`r,${resString},${displayId}`);
   } else {
     console.warn("Cannot send resolution via WebSocket: Connection not open.");
@@ -2683,6 +2763,11 @@ function sendResolutionToServer(width, height) {
  * nothing changes. Covers all three sinks (main-thread and worker generators
  * drive the `<video>`, the OffscreenCanvas worker drives `videoWorkerCanvas`).
  */
+/** The object-fit a presentation sink shares with the page canvas: the canvas's own, else cover (see fitStreamBox). */
+function sinkObjectFit() {
+  return (canvas && canvas.style.objectFit) || 'cover';
+}
+
 function syncSinkToCanvasStyle() {
   if (!canvas) return;
   let target = null, rendered = false, isMstg = false;
@@ -2698,7 +2783,7 @@ function syncSinkToCanvasStyle() {
   const geom = canvas.style.cssText;
   target.style.cssText = geom;
   target.style.display = 'block';
-  target.style.objectFit = 'fill';
+  target.style.objectFit = sinkObjectFit();
   if (isMstg) mstgLastGeom = geom; else videoWorkerLastGeom = geom;
   canvasGeomDirty = false;
   if (rendered) canvas.style.display = 'none';
@@ -2707,10 +2792,9 @@ function syncSinkToCanvasStyle() {
 /**
  * Sizes the canvas for a manual resolution: the backing buffer at the target
  * size (DPR-scaled unless CSS scaling, shared mode or manual mode pin it to
- * 1), the CSS box either scaled to fit the container or exact and centered.
+ * 1), the CSS box either scaled to fit the container (covering it when the
+ * aligned buffer's aspect ratio is within tolerance) or exact and centered.
  * The overlay input follows the box and the input handler is told to resize.
- * The per-row JPEG stripe ids, keyed by row offset, are reset because a
- * geometry change invalidates them.
  * @param {number} targetWidth
  * @param {number} targetHeight
  * @param {boolean} scaleToFit
@@ -2725,7 +2809,6 @@ function applyManualCanvasStyle(targetWidth, targetHeight, scaleToFit) {
     return;
   }
   canvasGeomDirty = true;
-  lastDrawnJpegStripeFrameId = {};
 
   const dpr = (isSharedMode || window.manual_resolution) ? 1 : streamDensity();
   const internalBufferWidth = alignResolution(targetWidth * dpr);
@@ -2738,53 +2821,31 @@ function applyManualCanvasStyle(targetWidth, targetHeight, scaleToFit) {
     syncWireGeom();
   }
   const container = canvas.parentElement;
-  const containerWidth = container.clientWidth;
-  const containerHeight = container.clientHeight;
+  const containerRect = container.getBoundingClientRect();
+  const containerWidth = containerRect.width || container.clientWidth;
+  const containerHeight = containerRect.height || container.clientHeight;
 
-  let cssWidthStr, cssHeightStr, topStr, leftStr;
+  // Policy hook (lib/stream-policy.js): the box follows the aligned buffer's
+  // aspect ratio and covers the stage within tolerance, so the encoder's
+  // alignment never shows as a black seam at an edge.
+  const box = fitStreamBox({ width: internalBufferWidth, height: internalBufferHeight },
+      { width: containerWidth, height: containerHeight }, scaleToFit);
+  const cssWidthStr = `${box.width}px`;
+  const cssHeightStr = `${box.height}px`;
+  const topStr = `${box.top}px`;
+  const leftStr = `${box.left}px`;
 
-  if (scaleToFit) {
-    const logicalAspectRatio = targetWidth / targetHeight;
-    const containerAspectRatio = containerWidth / containerHeight;
-    let cssWidth, cssHeight;
-    if (logicalAspectRatio > containerAspectRatio) {
-      cssWidth = containerWidth;
-      cssHeight = containerWidth / logicalAspectRatio;
-    } else {
-      cssHeight = containerHeight;
-      cssWidth = containerHeight * logicalAspectRatio;
-    }
-    const topOffset = (containerHeight - cssHeight) / 2;
-    const leftOffset = (containerWidth - cssWidth) / 2;
-
-    cssWidthStr = `${cssWidth}px`;
-    cssHeightStr = `${cssHeight}px`;
-    topStr = `${topOffset}px`;
-    leftStr = `${leftOffset}px`;
-
-    canvas.style.position = 'absolute';
-    canvas.style.width = cssWidthStr;
-    canvas.style.height = cssHeightStr;
-    canvas.style.top = topStr;
-    canvas.style.left = leftStr;
-    canvas.style.objectFit = 'contain';
-    console.log(`Applied manual style (Scaled): CSS ${cssWidth.toFixed(2)}x${cssHeight.toFixed(2)}, Buffer ${internalBufferWidth}x${internalBufferHeight}, Pos ${leftOffset.toFixed(2)},${topOffset.toFixed(2)}`);
-  } else {
-    cssWidthStr = `${targetWidth}px`;
-    cssHeightStr = `${targetHeight}px`;
-    const topOffset = (containerHeight - targetHeight) / 2;
-    const leftOffset = (containerWidth - targetWidth) / 2;
-    topStr = `${topOffset}px`;
-    leftStr = `${leftOffset}px`;
-
-    canvas.style.position = 'absolute';
-    canvas.style.width = cssWidthStr;
-    canvas.style.height = cssHeightStr;
-    canvas.style.top = topStr;
-    canvas.style.left = leftStr;
-    canvas.style.objectFit = 'fill';
-    console.log(`Applied manual style (Exact): CSS ${targetWidth}x${targetHeight}, Buffer ${internalBufferWidth}x${internalBufferHeight}, Pos ${leftOffset.toFixed(2)},${topOffset.toFixed(2)}`);
-  }
+  canvas.style.position = 'absolute';
+  canvas.style.width = cssWidthStr;
+  canvas.style.height = cssHeightStr;
+  // The page's own reset (Tailwind preflight: `img, video { max-width: 100% }`)
+  // would clamp the box back to the stage and leave the seam; the sinks copy this cssText.
+  canvas.style.maxWidth = 'none';
+  canvas.style.maxHeight = 'none';
+  canvas.style.top = topStr;
+  canvas.style.left = leftStr;
+  canvas.style.objectFit = box.objectFit;
+  console.log(`Applied manual style (${scaleToFit ? 'Scaled' : 'Exact'}): CSS ${box.width.toFixed(2)}x${box.height.toFixed(2)}, Buffer ${internalBufferWidth}x${internalBufferHeight}, Pos ${box.left.toFixed(2)},${box.top.toFixed(2)}`);
   canvas.style.display = 'block';
   updateCanvasImageRendering();
   syncSinkToCanvasStyle();
@@ -2804,9 +2865,8 @@ function applyManualCanvasStyle(targetWidth, targetHeight, scaleToFit) {
 
 /**
  * Sizes the canvas for the stream's own resolution: the backing buffer at the
- * DPR-scaled size and the CSS box at the stream size, centered in the
- * container, with the overlay input following. The per-row JPEG stripe ids
- * are reset as in applyManualCanvasStyle.
+ * DPR-scaled size and the CSS box covering the container (the aligned stream
+ * is at most a couple of pixels smaller), with the overlay input following.
  * @param {number} streamWidth
  * @param {number} streamHeight
  */
@@ -2816,7 +2876,6 @@ function resetCanvasStyle(streamWidth, streamHeight) {
     console.warn(`Cannot reset canvas style: Invalid stream dimensions ${streamWidth}x${streamHeight}`);
     return;
   }
-  lastDrawnJpegStripeFrameId = {};
   canvasGeomDirty = true;
 
   const dpr = streamDensity();
@@ -2830,49 +2889,38 @@ function resetCanvasStyle(streamWidth, streamHeight) {
     syncWireGeom();
   }
 
-  const cssWidth = `${streamWidth}px`;
-  const cssHeight = `${streamHeight}px`;
+  const container = canvas.parentElement;
+  const containerRect = container ? container.getBoundingClientRect() : null;
+  const stage = {
+    width: (containerRect && containerRect.width) || (container && container.clientWidth) || streamWidth,
+    height: (containerRect && containerRect.height) || (container && container.clientHeight) || streamHeight,
+  };
+  // Policy hook (lib/stream-policy.js): the aligned stream is a pixel or two
+  // smaller than the stage; the box covers the stage instead of leaving that
+  // remainder as a black seam.
+  const box = fitStreamBox({ width: internalBufferWidth, height: internalBufferHeight }, stage, true);
+  const cssWidth = `${box.width}px`;
+  const cssHeight = `${box.height}px`;
 
+  canvas.style.position = 'absolute';
   canvas.style.width = cssWidth;
   canvas.style.height = cssHeight;
+  canvas.style.maxWidth = 'none';
+  canvas.style.maxHeight = 'none';
+  canvas.style.top = `${box.top}px`;
+  canvas.style.left = `${box.left}px`;
 
   const overlayInput = document.getElementById('overlayInput');
   if (overlayInput) {
+      overlayInput.style.position = 'absolute';
       overlayInput.style.width = cssWidth;
       overlayInput.style.height = cssHeight;
-      overlayInput.style.position = 'absolute';
+      overlayInput.style.top = `${box.top}px`;
+      overlayInput.style.left = `${box.left}px`;
   }
+  console.log(`Reset canvas CSS to ${cssWidth} x ${cssHeight}, Pos ${box.left},${box.top}, object-fit: ${box.objectFit}. Buffer: ${internalBufferWidth}x${internalBufferHeight}`);
 
-  const container = canvas.parentElement;
-  if (container) {
-    const containerWidth = container.clientWidth;
-    const containerHeight = container.clientHeight;
-
-    const leftOffset = Math.floor((containerWidth - streamWidth) / 2);
-    const topOffset = Math.floor((containerHeight - streamHeight) / 2);
-
-    canvas.style.position = 'absolute';
-    canvas.style.top = `${topOffset}px`;
-    canvas.style.left = `${leftOffset}px`;
-    
-    if (overlayInput) {
-        overlayInput.style.top = `${topOffset}px`;
-        overlayInput.style.left = `${leftOffset}px`;
-    }
-
-    console.log(`Reset canvas CSS to ${streamWidth}px x ${streamHeight}px, Pos ${leftOffset},${topOffset}, object-fit: fill. Buffer: ${internalBufferWidth}x${internalBufferHeight}`);
-  } else {
-    canvas.style.position = 'absolute';
-    canvas.style.top = '0px';
-    canvas.style.left = '0px';
-    if (overlayInput) {
-        overlayInput.style.top = '0px';
-        overlayInput.style.left = '0px';
-    }
-    console.log(`Reset canvas CSS to ${streamWidth}px x ${streamHeight}px, Pos 0,0 (no parent metrics), object-fit: fill. Buffer: ${internalBufferWidth}x${internalBufferHeight}`);
-  }
-
-  canvas.style.objectFit = 'fill';
+  canvas.style.objectFit = box.objectFit;
   canvas.style.display = 'block';
   updateCanvasImageRendering();
   syncSinkToCanvasStyle();
@@ -2891,7 +2939,7 @@ function enableAutoResize() {
   if (originalWindowResizeHandler) {
     console.log("Switching to Auto Mode: Adding original (auto) debounced resize listener.");
     window.removeEventListener('resize', originalWindowResizeHandler);
-    window.addEventListener('resize', originalWindowResizeHandler);
+    lifecycle.listen(window, 'resize', originalWindowResizeHandler);
     if (typeof handleResizeUI_globalRef === 'function') {
       console.log("Triggering immediate auto-resize calculation for auto mode.");
       handleResizeUI_globalRef();
@@ -2918,14 +2966,14 @@ function disableAutoResize() {
   }
   console.log("Switching to Manual Mode Local Scaling: Adding direct manual scaling listener.");
   window.removeEventListener('resize', directManualLocalScalingHandler);
-  window.addEventListener('resize', directManualLocalScalingHandler);
+  lifecycle.listen(window, 'resize', directManualLocalScalingHandler);
   if (window.manual_resolution && !isSharedMode && manual_width != null && manual_height != null && manual_width > 0 && manual_height > 0) {
     console.log("Applying current manual canvas style after enabling direct manual resize handler.");
     applyManualCanvasStyle(manual_width, manual_height, scaleLocallyManual);
   }
 }
 
-/** Marks the container as a shared viewer (default cursor) and disables file upload. */
+/** Marks the container as a shared viewer (default cursor). */
 function updateUIForSharedMode() {
     if (!isSharedMode) return;
 
@@ -2934,28 +2982,21 @@ function updateUIForSharedMode() {
         videoContainer.classList.add('shared-user-mode');
         console.log("Shared mode: Added 'shared-user-mode' class to video container.");
     }
-
-    const globalFileInput = document.getElementById('globalFileInput');
-    if (globalFileInput) {
-        globalFileInput.disabled = true;
-        console.log("Shared mode: Disabled globalFileInput.");
-    }
 }
 
 /**
  * Builds the page: the video container with its status bar, overlay input,
  * canvas, the sink elements the engine can use, and the start button, plus
- * the hidden file input and keyboard-assist input on the body. Chooses the
- * video sink (see `supportsWindowMSTG`), logging it once since a canvas
- * fallback explains a session's CPU cost, and starts the worker handshake
- * early so its decoder is ready before the first frame, then sizes the canvas
- * for shared, manual or automatic resolution.
+ * the keyboard-assist input on the body. Chooses the video sink (see
+ * `supportsWindowMSTG`), logging it once since a canvas fallback explains a
+ * session's CPU cost, and starts the worker handshake early so its decoder is
+ * ready before the first frame, then sizes the canvas for shared, manual or
+ * automatic resolution.
  */
 const initializeUI = () => {
   injectCSS();
   setRealViewportHeight();
-  window.addEventListener('resize', setRealViewportHeight);
-  window.addEventListener('requestFileUpload', handleRequestFileUpload);
+  lifecycle.listen(window, 'resize', setRealViewportHeight);
   const appDiv = document.getElementById('app');
   if (!appDiv) {
     console.error("FATAL: Could not find #app element.");
@@ -2963,6 +3004,7 @@ const initializeUI = () => {
   }
   const videoContainer = document.createElement('div');
   videoContainer.className = 'video-container';
+  ownedVideoContainer = videoContainer;
   statusDisplayElement = document.createElement('div');
   statusDisplayElement.id = 'status-display';
   statusDisplayElement.className = 'status-bar';
@@ -3001,7 +3043,7 @@ const initializeUI = () => {
   if (!USE_OFFSCREEN_WORKER && supportsWindowMSTG) {
     announceSink('MediaStreamTrackGenerator on the page.');
   } else if (!USE_OFFSCREEN_WORKER) {
-    announceSink('2D canvas on the page — '
+    announceSink('2D canvas on the page - '
       + (offscreenWorkerEnabled
           ? 'no MediaStreamTrackGenerator in this browser and no video worker.'
           : 'the video worker is disabled (offscreen_worker=false).')
@@ -3039,7 +3081,7 @@ const initializeUI = () => {
           manual_width = 1280; manual_height = 720;
       }
       applyManualCanvasStyle(manual_width, manual_height, true);
-      window.addEventListener('resize', () => {
+      lifecycle.listen(window, 'resize', () => {
           if (isSharedMode && manual_width && manual_height && manual_width > 0 && manual_height > 0) {
               applyManualCanvasStyle(manual_width, manual_height, true);
           }
@@ -3069,13 +3111,6 @@ const initializeUI = () => {
   statusDisplayElement.classList.remove('hidden');
   const sidebarDiv = document.createElement('div');
   sidebarDiv.id = 'dev-sidebar';
-  const hiddenFileInput = document.createElement('input');
-  hiddenFileInput.type = 'file';
-  hiddenFileInput.id = 'globalFileInput';
-  hiddenFileInput.multiple = true;
-  hiddenFileInput.style.display = 'none';
-  document.body.appendChild(hiddenFileInput);
-  hiddenFileInput.addEventListener('change', handleFileInputChange);
 
   if (!document.getElementById('keyboard-input-assist')) {
     const keyboardInputAssist = document.createElement('input');
@@ -3096,11 +3131,12 @@ const initializeUI = () => {
     keyboardInputAssist.setAttribute('autocapitalize', 'off');
     keyboardInputAssist.setAttribute('spellcheck', 'false');
     document.body.appendChild(keyboardInputAssist);
+    ownedKeyboardAssist = keyboardInputAssist;
     console.log("Dynamically added #keyboard-input-assist element.");
   }
   appDiv.appendChild(videoContainer);
   updateStatusDisplay();
-  playButtonElement.addEventListener('click', playStream);
+  lifecycle.listen(playButtonElement, 'click', playStream);
 
   if (isSharedMode) {
       updateUIForSharedMode();
@@ -3201,11 +3237,11 @@ function processPendingChunksForStripe(stripe_y_start) {
 
 let decodedStripesQueue = [];
 /**
- * Main-thread back-buffer of the striped paths (h264enc-striped, jpeg).
+ * Main-thread back-buffer of the striped path (h264enc-striped).
  * Stripes accumulate here so damage-gated undamaged rows persist, and the
  * whole frame is blitted to the visible canvas once its last row has landed
- * or the stripe clock says it is complete — or, while stripes still flow, at
- * the frame-id boundary that proves it — so the display never shows a seam
+ * or the stripe clock says it is complete - or, while stripes still flow, at
+ * the frame-id boundary that proves it - so the display never shows a seam
  * between frame ids. Full-frame
  * h264enc presents one decoded frame atomically through the video sinks
  * instead.
@@ -3265,12 +3301,14 @@ self.onmessage = (e) => {
   }
   if (m.type === 'commit') {
     if (!back) return;
-    createImageBitmap(back).then((bitmap) => { self.postMessage({ type: 'frame', bitmap: bitmap }, [bitmap]); }).catch(() => {});
+    const frameId = m.frameId, sequence = m.sequence, generation = m.generation;
+    createImageBitmap(back).then((bitmap) => { self.postMessage({ type: 'frame', bitmap: bitmap, frameId: frameId, sequence: sequence, generation: generation }, [bitmap]); }).catch(() => {});
     return;
   }
 };
 `;
 let stripeWorker = null, stripeWorkerActive = false, stripeWorkerW = 0, stripeWorkerH = 0;
+let stripeCommitSequence = 0, stripePresentedSequence = 0, stripeGeometryGeneration = 0;
 
 /** Terminates the stripe compositor worker. */
 function deactivateStripeWorker() {
@@ -3298,14 +3336,31 @@ function ensureStripeWorker() {
     return false;
   }
   console.info('[Selkies] striped codecs: compositing on an OffscreenCanvas in a worker.');
-  stripeWorker.onerror = () => deactivateStripeWorker();
+  const activeStripeWorker = stripeWorker;
+  stripeWorker.onerror = () => { if (stripeWorker === activeStripeWorker) deactivateStripeWorker(); };
   stripeWorker.onmessage = (ev) => {
     const m = ev.data;
     if (!m || m.type !== 'frame') return;
+    if (stripeWorker !== activeStripeWorker || !stripeWorkerActive) {
+      try { m.bitmap.close(); } catch (err) { /* ignore */ }
+      return;
+    }
+    if (m.generation !== stripeGeometryGeneration || m.sequence <= stripePresentedSequence) {
+      try { m.bitmap.close(); } catch (err) { /* ignore */ }
+      return;
+    }
+    let painted = false;
     if (canvasContext && canvas && canvas.width > 0 && canvas.height > 0) {
-      try { canvasContext.drawImage(m.bitmap, 0, 0); } catch (err) { /* ignore */ }
+      try { canvasContext.drawImage(m.bitmap, 0, 0); painted = true; } catch (err) { /* ignore */ }
     }
     try { m.bitmap.close(); } catch (err) { /* ignore */ }
+    if (painted) {
+      stripePresentedSequence = m.sequence;
+      frameCount++;
+      lastPresentedVideoFrameId = m.frameId;
+      lastPresentedVideoFrameAt = performance.now();
+      markFramePainted();
+    }
   };
   stripeWorkerW = 0; stripeWorkerH = 0;
   return true;
@@ -3320,6 +3375,7 @@ function stripeCompositeBegin() {
   if (ensureStripeWorker()) {
     stripeWorkerActive = true;
     if (canvas.width > 0 && canvas.height > 0 && (stripeWorkerW !== canvas.width || stripeWorkerH !== canvas.height)) {
+      stripeGeometryGeneration++;
       stripeWorker.postMessage({ type: 'resize', width: canvas.width, height: canvas.height });
       stripeWorkerW = canvas.width; stripeWorkerH = canvas.height;
       stripePendingFrameId = null; stripePendingDirty = false;
@@ -3352,17 +3408,16 @@ function stripeCompositeDraw(stripe, yPos) {
  * which is what `window.fps` reports for them.
  */
 function stripeCompositePresent() {
-  frameCount++;
-  lastPresentedVideoFrameId = stripePendingFrameId;
-  lastPresentedVideoFrameAt = performance.now();
   if (stripeWorkerActive && stripeWorker) {
-    try { stripeWorker.postMessage({ type: 'commit' }); } catch (e) { /* ignore */ }
+    try { stripeWorker.postMessage({ type: 'commit', frameId: stripePendingFrameId, sequence: ++stripeCommitSequence, generation: stripeGeometryGeneration }); } catch (e) { /* ignore */ }
   } else if (canvasContext && canvas.width > 0 && canvas.height > 0) {
-    canvasContext.drawImage(stripeBackCanvas, 0, 0);
+    try { canvasContext.drawImage(stripeBackCanvas, 0, 0); } catch (e) { return; }
+    frameCount++;
+    lastPresentedVideoFrameId = stripePendingFrameId;
+    lastPresentedVideoFrameAt = performance.now();
+    markFramePainted();
   }
 }
-/** Newest JPEG-stripe frame id drawn per row offset, so older out-of-order stripes are skipped. */
-let lastDrawnJpegStripeFrameId = {};
 
 /** Disarms the START_VIDEO watchdog. */
 function clearStartVideoWatchdog() {
@@ -3385,7 +3440,7 @@ function armVisibleFrameProbe() {
   const chunksBefore = window.videoChunksReceived;
   requestKeyframe();
   setTimeout(() => {
-    if (document.hidden || window.videoChunksReceived !== chunksBefore) return;
+    if (isStreamHidden() || window.videoChunksReceived !== chunksBefore) return;
     if (!isVideoPipelineActive) return;
     if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
     console.warn('No video since the tab came back; restarting the stream.');
@@ -3403,7 +3458,7 @@ function armVisibleFrameProbe() {
  */
 function onStartVideoWatchdogTimeout() {
   startVideoWatchdogTimer = null;
-  if (document.hidden) { startVideoWatchdogAttempts = 0; return; }
+  if (isStreamHidden()) { startVideoWatchdogAttempts = 0; return; }
   if (!websocket || websocket.readyState !== WebSocket.OPEN) { startVideoWatchdogAttempts = 0; return; }
   startVideoWatchdogAttempts++;
   if (startVideoWatchdogAttempts <= START_VIDEO_WATCHDOG_MAX_ATTEMPTS) {
@@ -3445,7 +3500,7 @@ function armSharedStallWatchdog() {
   sharedStallRecoveryAttempts = 0;
   sharedStallNextRecoveryTime = 0;
   sharedStallWatchdogId = setInterval(() => {
-    if (document.hidden || sharedVideoPaused || sharedClientState !== 'ready') {
+    if (isStreamHidden() || sharedVideoPaused || sharedClientState !== 'ready') {
       lastSharedVideoChunkTime = performance.now();
       return;
     }
@@ -3477,7 +3532,7 @@ function armSharedStallWatchdog() {
  */
 function handleDecodedVncStripeFrame(yPos, frame) {
   if (currentEncoderMode === 'h264enc' && yPos === 0) {
-    if (document.hidden || (clientMode === 'websockets' && !isSharedMode && !isVideoPipelineActive)) {
+    if (isStreamHidden() || (clientMode === 'websockets' && !isSharedMode && !isVideoPipelineActive)) {
       try { frame.close(); } catch (e) {}
       return;
     }
@@ -3492,10 +3547,10 @@ function handleDecodedVncStripeFrame(yPos, frame) {
     } else {
       if (canvas && canvasContext && canvas.width > 0 && canvas.height > 0) {
         canvasContext.drawImage(frame, 0, 0);
+        markFramePainted();
       }
       try { frame.close(); } catch (e) {}
     }
-    if (!streamStarted) startStream();
     return;
   }
   decodedStripesQueue.push({
@@ -3505,20 +3560,13 @@ function handleDecodedVncStripeFrame(yPos, frame) {
   });
 }
 
-/** HTTP uploads and the drag-drop/file-picker plumbing (lib/file-upload.js); shared viewers never upload. */
-const fileUploader = createFileUploader({ canUpload: () => !isSharedMode });
-const handleRequestFileUpload = fileUploader.handleRequestFileUpload;
-const handleFileInputChange = fileUploader.handleFileInputChange;
-const handleDragOver = fileUploader.handleDragOver;
-const handleDrop = fileUploader.handleDrop;
-
 /** Requests a screen wake lock so the device does not sleep mid-session. */
 const requestWakeLock = async () => {
   if (wakeLockSentinel !== null) return;
   if ('wakeLock' in navigator) {
     try {
       wakeLockSentinel = await navigator.wakeLock.request('screen');
-      wakeLockSentinel.addEventListener('release', () => {
+      lifecycle.listen(wakeLockSentinel, 'release', () => {
         console.log('Screen Wake Lock was released automatically.');
         wakeLockSentinel = null;
       });
@@ -3565,18 +3613,32 @@ function hideStreamOverlay() {
 const startStream = () => {
   if (streamStarted) return;
   streamStarted = true;
+  window.__BROWSER_LOL_STREAMING__ = true;
+  // This session paints now; whatever an evicted one left can go.
+  clearFrozenFrame();
+  window.postMessage({ type: 'viewer-status', status: 'streaming', transport: 'websockets' }, window.location.origin);
   hideStreamOverlay();
+  requestWakeLock();
   console.log("Stream started (UI elements hidden).");
 };
+
+function markFramePainted() {
+  // Runtime hook (lib/runtime-config.js): the transport that owns this core.
+  if (viewerCoreStopped || lifecycle.disposed
+      || runtimeConfig().transport?.isEnding() === true
+      || runtimeConfig().transport?.isSuperseded() === true) return;
+  hasPaintedFrame = true;
+  if (!streamStarted) startStream();
+}
 
 /**
  * Creates the Input handler on the overlay input once the server has assigned
  * the client's role and slot, wires its dashboard chords to the dashboards
  * (`toggleDashboard`, `toggleTouchGamepad` window messages; fullscreen,
  * Ctrl+Shift+F, stays inside Input), publishes it as
- * `window.webrtcInput`, installs the automatic or manual resize handling, and
- * attaches file drop and mobile keyboard assistance. A viewer role keeps the
- * gamepad but has its pointer and keyboard context detached.
+ * `window.webrtcInput` and installs the automatic or manual resize handling.
+ * A viewer role keeps the gamepad but has its pointer and keyboard context
+ * detached.
  */
 const initializeInput = () => {
   if (inputInitialized) {
@@ -3670,6 +3732,7 @@ const initializeInput = () => {
       inputInstance.detach_context();
   }
   window.webrtcInput = inputInstance;
+  ownedInputInstance = inputInstance;
   inputInstance.setDisplayLayouts(latestDisplayLayouts, displayId);
   applyEffectiveCursorSetting();
 
@@ -3678,8 +3741,8 @@ const initializeInput = () => {
       requestWakeLock();
     };
     overlayInput.removeEventListener('pointerdown', handlePointerDown);
-    overlayInput.addEventListener('pointerdown', handlePointerDown);
-    overlayInput.addEventListener('contextmenu', e => {
+    lifecycle.listen(overlayInput, 'pointerdown', handlePointerDown);
+    lifecycle.listen(overlayInput, 'contextmenu', e => {
       e.preventDefault();
     });
   }
@@ -3722,7 +3785,7 @@ const initializeInput = () => {
     appliedStreamDensity = dpr;
     if (inputInstance && inputInstance.setStreamDensity) inputInstance.setStreamDensity(dpr);
     const MAX_DIM = 4080;
-    
+
     if (evenWidth * dpr > MAX_DIM) {
         evenWidth = Math.floor(MAX_DIM / dpr);
         evenWidth = alignResolution(evenWidth);
@@ -3766,7 +3829,7 @@ const initializeInput = () => {
       if (mql) { try { mql.removeEventListener('change', onDprChange); } catch (_) {} }
       const dpr = window.devicePixelRatio || 1;
       mql = window.matchMedia(`(resolution: ${dpr}dppx)`);
-      mql.addEventListener('change', onDprChange, { once: true });
+      lifecycle.listen(mql, 'change', onDprChange, { once: true });
     };
     arm();
     // An emulated density change fires neither the query nor a resize;
@@ -3779,7 +3842,7 @@ const initializeInput = () => {
     console.log("Shared mode: Auto-resize event listener (originalWindowResizeHandler) NOT attached.");
   } else if (!window.manual_resolution) {
     console.log("initializeInput: Auto-resolution mode. Attaching 'resize' event listener for subsequent changes.");
-    window.addEventListener('resize', originalWindowResizeHandler);
+    lifecycle.listen(window, 'resize', originalWindowResizeHandler);
     const videoContainer = document.querySelector('.video-container');
     let currentAutoWidth, currentAutoHeight;
     if (videoContainer) {
@@ -3806,35 +3869,6 @@ const initializeInput = () => {
     }
   }
 
-  if (overlayInput && !isSharedMode) {
-    overlayInput.addEventListener('dragover', handleDragOver);
-    overlayInput.addEventListener('drop', handleDrop);
-  } else if (overlayInput && isSharedMode) {
-    console.log("Shared mode: Drag/drop file upload listeners NOT attached to overlayInput.");
-  } else {
-    console.warn("initializeInput: overlayInput not found, cannot attach drag/drop listeners.");
-  }
-
-  const keyboardInputAssist = document.getElementById('keyboard-input-assist');
-  if (keyboardInputAssist && inputInstance && !isSharedMode) {
-    // Typed characters go through Input's own listener on this element; only
-    // the control keys mobile keyboards emit as keydown are forwarded here.
-    keyboardInputAssist.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.keyCode === 13) {
-        inputInstance._sendMomentaryKey(0xFF0D);
-        event.preventDefault();
-        keyboardInputAssist.value = '';
-      } else if (event.key === 'Backspace' || event.keyCode === 8) {
-        inputInstance._sendMomentaryKey(0xFF08);
-        event.preventDefault();
-      }
-    });
-    console.log("initializeInput: Added 'input' and 'keydown' listeners to #keyboard-input-assist.");
-  } else if (isSharedMode) {
-    console.log("Shared mode: Keyboard input assist listeners NOT attached.");
-  } else {
-    console.error("initializeInput: Could not add listeners to keyboard assist: Element or Input handler instance not found.");
-  }
   console.log("Input system initialized.");
 };
 
@@ -3870,7 +3904,7 @@ async function applyOutputDevice() {
   }
 }
 
-window.addEventListener('message', receiveMessage, false);
+
 
 /** Applies the gamepad toggle to the manager's polling; a shared page always polls. */
 function applyGamepadPolling() {
@@ -3935,7 +3969,7 @@ function applyStartPolicy(serverSettings) {
   if (untouched('webcam') && startsOn('webcam_on_start', false) && webcamEnabled && !lockedOff('webcam_enabled')) {
     startWebcamCapture();
   }
-  const gamepadStored = window.localStorage.getItem(`${storageAppName}_isGamepadEnabled`) !== null;
+  const gamepadStored = localStore.getItem(`${storageAppName}_isGamepadEnabled`) !== null;
   if (untouched('gamepad') && !gamepadStored) {
     const wanted = startsOn('gamepad_on_start', true);
     if (isGamepadEnabled !== wanted) {
@@ -4042,7 +4076,7 @@ function receiveMessage(event) {
         kbdAssistInput.value = '';
         kbdAssistInput.focus();
         console.log("Focused #keyboard-input-assist element.");
-        mainInteractionOverlay.addEventListener(
+        lifecycle.listen(mainInteractionOverlay,
           "touchstart",
           () => {
             if (document.activeElement === kbdAssistInput) {
@@ -4073,7 +4107,8 @@ function receiveMessage(event) {
         if (changed) {
           updateCanvasImageRendering();
           if (window.manual_resolution && manual_width != null && manual_height != null) {
-            sendResolutionToServer(manual_width, manual_height);
+            // A manual resolution is the exact framebuffer, independent of CSS scaling: only the
+            // box changes. Resending it could replay a size adopted from a stale server frame.
             applyManualCanvasStyle(manual_width, manual_height, scaleLocallyManual);
           } else if (!isSharedMode) {
             if (window.enable_resize !== false || displayId === 'display2') {
@@ -4127,6 +4162,7 @@ function receiveMessage(event) {
         console.error('Received invalid width/height for setManualResolution:', message);
         break;
       }
+      if (websocket && websocket.readyState === WebSocket.OPEN) websocket.send(`SETTINGS,${JSON.stringify({ release_screen: true, manual_resolution: true, manual_width: width, manual_height: height, displayId })}`);
       console.log(`Setting manual resolution: ${width}x${height} (logical)`);
       window.manual_resolution = true;
       manual_width = alignResolution(width);
@@ -4150,6 +4186,7 @@ function receiveMessage(event) {
         console.log("Shared mode: resetResolutionToWindow message ignored.");
         break;
       }
+      if (websocket && websocket.readyState === WebSocket.OPEN) websocket.send(`SETTINGS,${JSON.stringify({ release_screen: true, manual_resolution: false, displayId })}`);
       console.log("Resetting resolution to window size.");
       window.manual_resolution = false;
       manual_width = null;
@@ -4171,6 +4208,19 @@ function receiveMessage(event) {
       }
       enableAutoResize();
       break;
+    case 'getStreamProfile':
+      publishStreamProfile();
+      break;
+    case 'desktopControlCommand': {
+      const command = desktopControlInput(message);
+      if (command && !isSharedMode && websocket?.readyState === WebSocket.OPEN) websocket.send(command);
+      break;
+    }
+    case 'setStreamProfile':
+      if (!isSharedMode && displayId === 'primary' && websocket?.readyState === WebSocket.OPEN) {
+        websocket.send(`SETTINGS,${JSON.stringify({ stream_profile: message.profile, stream_profile_request: message.request })}`);
+      }
+      break;
     case 'settings':
       console.log('Received settings message:', message.settings);
       handleSettingsMessage(message.settings);
@@ -4179,7 +4229,20 @@ function receiveMessage(event) {
       console.log('Received getStats message.');
       sendStatsMessage();
       break;
+    case 'clipboardPasteCancel':
+      cancelPanelPaste(message.requestId);
+      break;
     case 'clipboardUpdateFromUI':
+      if (message.paste === true) {
+        const input = window.webrtcInput;
+        void pasteFromPanel({
+          text: message.text, input, requestId: message.requestId, deadline: message.deadline, sendClipboard: sendExplicitClipboard,
+          isCurrent: () => !isSharedMode && !!input && input === window.webrtcInput && input.inputAttached,
+          report: ok => window.postMessage({ type: 'clipboardPasteResult', requestId: message.requestId, ok }, window.location.origin)
+        });
+        break;
+      }
+
       console.log('Received clipboardUpdateFromUI message.');
       if (isSharedMode) {
         console.log("Shared mode: Clipboard write to server blocked.");
@@ -4247,6 +4310,7 @@ function receiveMessage(event) {
           break;
         }
         pipelinesToggledByUser.add('video');
+        if (!desiredState) videoPausedForHiddenTab = false;
         if (isVideoPipelineActive !== desiredState) {
           isVideoPipelineActive = desiredState;
           stateChangedFromControl = true;
@@ -4419,9 +4483,6 @@ function receiveMessage(event) {
         trackpadMode = true;
         setBoolParam('trackpadMode', true);
         window.webrtcInput.setTrackpadMode(true);
-        if (websocket && websocket.readyState === WebSocket.OPEN) {
-          websocket.send("SET_NATIVE_CURSOR_RENDERING,1");
-        }
       }
       break;
     case 'touchinput:touch':
@@ -4429,9 +4490,6 @@ function receiveMessage(event) {
         trackpadMode = false;
         setBoolParam('trackpadMode', false);
         window.webrtcInput.setTrackpadMode(false);
-        if (websocket && websocket.readyState === WebSocket.OPEN) {
-          websocket.send("SET_NATIVE_CURSOR_RENDERING,0");
-        }
       }
       break;
     default:
@@ -4440,8 +4498,8 @@ function receiveMessage(event) {
 }
 
 /**
- * Tells the dashboard why a clipboard-image upload was skipped, in the
- * `fileUpload` warning channel transfer warnings already use.
+ * Tells the dashboard why a clipboard-image upload was skipped, on the
+ * `fileUpload` warning channel.
  * @param {string} reason Human-readable reason.
  * @param {string} code Translation key the dashboards map to a localized message.
  */
@@ -4502,6 +4560,9 @@ async function sendClipboardData(data, mimeType = 'text/plain', onSkip = null) {
         skip('not connected', 'clipboardSkipNotConnected');
         return;
     }
+    if (typeof data === 'string' && mimeType === 'text/plain') {
+        window.postMessage({ type: 'clipboardContentUpdate', text: data }, window.location.origin);
+    }
     const isBinary = data instanceof ArrayBuffer || data instanceof Uint8Array;
     let dataBytes;
     if (isBinary) {
@@ -4526,7 +4587,9 @@ async function sendClipboardData(data, mimeType = 'text/plain', onSkip = null) {
     let transferAborted = false;
     await sendClipboardChunked(dataBytes, mimeType, {
         worker: clipboardWorker,
-        send: (m) => websocket.send(m),
+        // The socket can be torn down mid-transfer (a mode switch, a supersede);
+        // a chunk sent into the gap must not throw a page error.
+        send: (m) => { if (websocket && websocket.readyState === WebSocket.OPEN) websocket.send(m); },
         waitDrain: async () => {
             while (websocket.bufferedAmount > CLIPBOARD_BACKLOG_BYTES) {
                 await new Promise(resolve => setTimeout(resolve, CLIPBOARD_BACKLOG_POLL_MS));
@@ -4581,28 +4644,15 @@ function handleSettingsMessage(settings, fromServer) {
     }
   }
   if (settings.encoder !== undefined) {
-    let newEncoderSetting = settings.encoder;
-    if (!canDecodeEncoder(newEncoderSetting)) {
-      if (fromServer) {
-        showUndecodableEncoderNotice(newEncoderSetting);
-      } else {
-        console.warn(`Encoder ${newEncoderSetting} needs WebCodecs, which this browser lacks; keeping jpeg.`);
-      }
-      newEncoderSetting = 'jpeg';
-    } else {
-      clearUndecodableEncoderNotice();
-    }
+    const newEncoderSetting = settings.encoder;
     if (currentEncoderMode !== newEncoderSetting) {
         currentEncoderMode = newEncoderSetting;
         updateVideoDivert();
         storeString('encoder', currentEncoderMode);
         settingsChanged = true;
-        if (newEncoderSetting === 'jpeg' || newEncoderSetting === 'h264enc' || newEncoderSetting === 'h264enc-striped') {
-        }
         if (newEncoderSetting !== 'h264enc-striped') {
             clearAllVncStripeDecoders();
         }
-        cleanupJpegStripeQueue();
         clearDecodedStripesQueue();
         setTimeout(() => {
             if (websocket && websocket.readyState === WebSocket.OPEN) {
@@ -4693,7 +4743,7 @@ function handleSettingsMessage(settings, fromServer) {
     // Persisted even when server-authored: the reload settles on the stored flag.
     setBoolParam('debug', debug);
     console.log(`Applied debug setting: ${debug}. Reloading...`);
-    setTimeout(() => { window.location.reload(); }, 700);
+    setTimeout(() => { if (!viewerCoreStopped) window.location.reload(); }, 700);
     return;
   }
   if (settings.rate_control_mode !== undefined) {
@@ -4736,6 +4786,44 @@ function fetchLatestRCvalue(newMode) {
 };
 
 /** Posts a `stats` snapshot (server, network, client fps, buffers, pipeline state) to the parent window. */
+/** Periodic one-line snapshot of the whole pipeline; the only diagnostic a support report can carry. */
+function logConnectionHealth() {
+  const health = {
+    timestamp: new Date().toISOString(),
+    connection: {
+      status,
+      mode: clientMode,
+      role: clientRole,
+      slot: clientSlot,
+      websocketState: websocket ? ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][websocket.readyState] : 'NO_SOCKET',
+      isSharedMode,
+      displayId,
+    },
+    streaming: {
+      streamStarted,
+      isVideoPipelineActive,
+      isAudioPipelineActive,
+      isMicrophoneActive,
+    },
+    performance: {
+      fps: window.fps,
+      configuredFramerate: framerate,
+      encoder: currentEncoderMode,
+      video_fullcolor,
+      video_streaming_mode,
+    },
+    buffers: {
+      audioBuffer: window.currentAudioBufferSize,
+    },
+    network: {
+      bandwidthMbps: networkStat.bandwidthMbps,
+      latencyMs: networkStat.latencyMs,
+    },
+    server: { cpu: cpuStat, gpu: gpuStat },
+  };
+  console.log('[viewer] Connection Health:', JSON.stringify(health, null, 2));
+}
+
 function sendStatsMessage() {
   const stats = {
     gpu: gpuStat,
@@ -4776,6 +4864,7 @@ function initWebsockets() {
   /** Focus and gesture local-to-server clipboard sync (lib/clipboard-sync.js); text is deduped server-side. */
   localClipboardSender = createLocalClipboardSender({
     isChromium,
+    syncState: pageClipboardSyncState,
     getDeferredWriteInFlight: () => deferredClipboardWriter.getInFlight(),
     isSharedMode: () => isSharedMode,
     canSync: () => !!window.clipboard_enabled,
@@ -4789,7 +4878,7 @@ function initWebsockets() {
   // Firefox and WebKit raise a paste prompt on every focus read, so only
   // Chromium reads on focus; the others read on the paste gestures.
   if (isChromium) {
-    window.addEventListener('focus', () => { readLocalClipboardAndSend(); });
+    lifecycle.listen(window, 'focus', () => { readLocalClipboardAndSend(); });
   }
 
   /** Paste-ordering hold and the copy/paste gestures (lib/clipboard-sync.js); only the gates and the send are per-core. */
@@ -4804,6 +4893,7 @@ function initWebsockets() {
     getSendInFlight: () => localClipboardSender.getSendInFlight(),
     getDeferredWriteInFlight: () => deferredClipboardWriter.getInFlight(),
   });
+  activeClipboardGestures = clipboardGestures;
   clipboardGestures.wire();
 
   /** Clears the canvas so a paused stream does not show a stale frame. */
@@ -4816,25 +4906,11 @@ function initWebsockets() {
     }
   };
   let hiddenVideoStopTimer = null;
-  /** Whether the tab-hide handler paused the video; only its own pause is resumed, a dashboard stop stays stopped. */
-  let videoPausedForHiddenTab = false;
-  /**
-   * Pauses video while the tab is hidden and resumes it on show. A shared
-   * viewer pauses only its own feed (the server drops this socket from the
-   * broadcast and resumes it with a reset and IDR; control, cursor and audio
-   * stay live). A controller's pause is deferred, because a navigating
-   * document reports hidden just before it unloads and a STOP_VIDEO sent then
-   * races the successor connection; timers never fire in an unloading
-   * document. The resume is keyed on the pause this handler performed, never
-   * on the pipeline flag, which a status sync could flip while hidden. The
-   * wake lock, dropped by the browser on hide, is re-taken after the resume
-   * send, never in front of it. A decoder the browser reclaimed in the
-   * background is re-created lazily by the frame sink.
-   */
-  document.addEventListener('visibilitychange', async () => {
+  // Keep manual stops separate from visibility pauses.
+  async function handleStreamVisibility({ immediate = false } = {}) {
     if (isSharedMode) {
       if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
-      if (document.hidden) {
+      if (isStreamHidden()) {
         if (!sharedVideoPaused) {
           sharedVideoPaused = true;
           try { websocket.send('STOP_VIDEO'); } catch (_) {}
@@ -4857,11 +4933,15 @@ function initWebsockets() {
       }
       return;
     }
-    if (document.hidden) {
+    if (isStreamHidden()) {
+      if (immediate && hiddenVideoStopTimer !== null) {
+        clearTimeout(hiddenVideoStopTimer);
+        hiddenVideoStopTimer = null;
+      }
       if (hiddenVideoStopTimer === null) {
-        hiddenVideoStopTimer = setTimeout(() => {
+        const pause = () => {
           hiddenVideoStopTimer = null;
-          if (!document.hidden) return;
+          if (!isStreamHidden()) return;
           console.log('Tab is hidden, stopping video pipeline if active.');
           if (websocket && websocket.readyState === WebSocket.OPEN) {
             if (isVideoPipelineActive) {
@@ -4878,7 +4958,9 @@ function initWebsockets() {
               }
             }
           }
-        }, 250);
+        };
+        if (immediate) pause();
+        else hiddenVideoStopTimer = setTimeout(pause, 250);
       }
     } else {
       if (hiddenVideoStopTimer !== null) { clearTimeout(hiddenVideoStopTimer); hiddenVideoStopTimer = null; }
@@ -4905,37 +4987,8 @@ function initWebsockets() {
         await requestWakeLock();
       }
     }
-  });
-
-  /**
-   * Decodes a JPEG stripe and queues it for the paint loop: ImageDecoder
-   * (WebCodecs) where the context is secure, createImageBitmap elsewhere; both
-   * yield an image the render and cleanup paths handle alike.
-   * @param {number} startY
-   * @param {ArrayBuffer} jpegData
-   * @param {number} frameId
-   */
-  async function decodeAndQueueJpegStripe(startY, jpegData, frameId) {
-    jpegStripeDecodesPending++;
-    try {
-      let image;
-      if (typeof ImageDecoder !== 'undefined') {
-        const imageDecoder = new ImageDecoder({ data: jpegData, type: 'image/jpeg' });
-        image = (await imageDecoder.decode()).image;
-        imageDecoder.close();
-      } else if (typeof createImageBitmap === 'function') {
-        image = await createImageBitmap(new Blob([jpegData], { type: 'image/jpeg' }));
-      } else {
-        console.warn('No JPEG decoder available (ImageDecoder and createImageBitmap both missing).');
-        return;
-      }
-      jpegStripeRenderQueue.push({ image, startY, frameId });
-    } catch (error) {
-      console.error('Error decoding JPEG stripe:', error, 'startY:', startY, 'dataLength:', jpegData.byteLength);
-    } finally {
-      jpegStripeDecodesPending--;
-    }
   }
+  streamVisibility = watchStreamVisibility(lifecycle, handleStreamVisibility);
 
   let paintScheduled = false;
   /**
@@ -4957,8 +5010,7 @@ function initWebsockets() {
    * frame as soon as its last row lands (the server emits a frame's stripes
    * in ascending order, so the last row proves it complete) or the socket and
    * the decoders go quiet (the stripe clock), falling back to presenting at
-   * frame-id boundaries while stripes still flow; JPEG skips stripes that
-   * decoded out of order; the shared main decoder path keeps the adaptive
+   * frame-id boundaries while stripes still flow; the shared main decoder path keeps the adaptive
    * jitter cushion, closing everything older than it in one tick because
    * draining one per rAF would let a burst back up the decoder's bounded
    * output pool. Leaving a full-frame mode tears both video sinks down
@@ -4972,7 +5024,7 @@ function initWebsockets() {
     }
 
     if (mstgActive || videoWorkerActive) {
-      const fullFrameMode = (currentEncoderMode !== 'jpeg' && currentEncoderMode !== 'h264enc-striped');
+      const fullFrameMode = currentEncoderMode !== 'h264enc-striped';
       if (mstgActive && !fullFrameMode) deactivateMstg();
       // Diverted striped modes present through the worker sink; only an
       // undiverted striped mode reclaims the page canvas from it.
@@ -4992,10 +5044,7 @@ function initWebsockets() {
       }
     }
 
-    let jpegPaintedThisFrame = false;
-
     if (currentEncoderMode === 'h264enc') {
-      let paintedSomethingThisCycle = false;
       if (decodedStripesQueue.length > 0) {
         // Index math rather than repeated shift(), which re-indexes the array each time.
         const lastIdx = decodedStripesQueue.length - 1;
@@ -5011,19 +5060,15 @@ function initWebsockets() {
         } else {
           if (canvas.width > 0 && canvas.height > 0) {
             canvasContext.drawImage(frame, 0, 0);
+            markFramePainted();
           }
           try { frame.close(); } catch (e) {}
         }
-        paintedSomethingThisCycle = true;
-      }
-      if (paintedSomethingThisCycle && !streamStarted) {
-        startStream();
       }
     } else if (currentEncoderMode === 'h264enc-striped') {
-      if (USE_OFFSCREEN_WORKER && !videoWorker && !workerDecodeFailed && videoWorkerSpawnAttempts < 3) {
+      if (USE_OFFSCREEN_WORKER && !videoWorker && !workerDecodeFailed) {
         ensureVideoWorker();
       }
-      let paintedSomethingThisCycle = false;
       const ready = stripeCompositeBegin();
       const drained = stripeDecodesDrained();
       const settled = drained && stripeClock.settled();
@@ -5034,7 +5079,6 @@ function initWebsockets() {
           if (!settled && stripePendingFrameId !== null && fid !== stripePendingFrameId && stripePendingDirty) {
             stripeCompositePresent();
             stripePendingDirty = false;
-            paintedSomethingThisCycle = true;
           }
           stripePendingFrameId = fid;
           if (stripeData.yPos + stripeData.frame.displayHeight >= canvas.height) bottomDrawn = true;
@@ -5046,82 +5090,6 @@ function initWebsockets() {
       }
       decodedStripesQueue = [];
       if (drained && (settled || bottomDrawn) && stripePendingDirty
-          && canvas.width > 0 && canvas.height > 0) {
-        stripeCompositePresent();
-        stripePendingDirty = false;
-        paintedSomethingThisCycle = true;
-      }
-      if (paintedSomethingThisCycle && !streamStarted) {
-        startStream();
-      }
-    } else if (currentEncoderMode === 'jpeg') {
-      if (USE_OFFSCREEN_WORKER && !videoWorker && !workerDecodeFailed && videoWorkerSpawnAttempts < 3) {
-        ensureVideoWorker();
-      }
-      const drained = jpegStripeDecodesPending === 0;
-      const settled = drained && stripeClock.settled();
-      let bottomDrawn = false;
-      if (canvasContext && jpegStripeRenderQueue.length > 0) {
-        if ((canvas.width === 0 || canvas.height === 0) || (canvas.width === 300 && canvas.height === 150)) {
-          const firstStripe = jpegStripeRenderQueue[0];
-          const firstHeight = firstStripe && firstStripe.image
-            && (firstStripe.image.displayHeight ?? firstStripe.image.height);
-          const firstWidth = firstStripe && firstStripe.image
-            && (firstStripe.image.displayWidth ?? firstStripe.image.width);
-          if (firstStripe && firstStripe.image
-              && (firstStripe.startY + firstHeight > canvas.height || firstWidth > canvas.width)) {
-            console.warn(`[paintVideoFrame] Canvas dimensions (${canvas.width}x${canvas.height}) may be too small for JPEG stripes.`);
-          }
-        }
-        const ready = stripeCompositeBegin();
-        while (jpegStripeRenderQueue.length > 0) {
-          const segment = jpegStripeRenderQueue.shift();
-          if (segment && segment.image) {
-            const segFrameId = segment.frameId;
-            const lastDrawn = lastDrawnJpegStripeFrameId[segment.startY];
-            if (segFrameId !== undefined && lastDrawn !== undefined) {
-              const behindBy = (lastDrawn - segFrameId) & 0xFFFF;
-              const isOlder = behindBy > 0 && behindBy <= JPEG_STRIPE_REORDER_WINDOW;
-              if (isOlder) {
-                try { segment.image.close(); } catch (closeError) { /* ignore */ }
-                continue;
-              }
-            }
-            try {
-              if (ready) {
-                if (!settled && segFrameId !== undefined && stripePendingFrameId !== null &&
-                    segFrameId !== stripePendingFrameId && stripePendingDirty) {
-                  stripeCompositePresent();
-                  stripePendingDirty = false;
-                }
-                if (segFrameId !== undefined) stripePendingFrameId = segFrameId;
-                const stripeHeight = segment.image.displayHeight ?? segment.image.height;
-                if (segment.startY + stripeHeight >= canvas.height) bottomDrawn = true;
-                stripeCompositeDraw(segment.image, segment.startY);
-                stripePendingDirty = true;
-              } else {
-                try { segment.image.close(); } catch (closeError) { /* ignore */ }
-              }
-              if (segFrameId !== undefined) {
-                lastDrawnJpegStripeFrameId[segment.startY] = segFrameId;
-              }
-              jpegPaintedThisFrame = true;
-            } catch (e) {
-              console.error("[paintVideoFrame] Error drawing JPEG segment:", e, segment);
-              if (segment.image && typeof segment.image.close === 'function') {
-                try { segment.image.close(); } catch (closeError) { /* ignore */ }
-              }
-            }
-          }
-        }
-        if (jpegPaintedThisFrame) {
-          if (!streamStarted) {
-            startStream();
-            if (!inputInitialized && !isSharedMode) initializeInput();
-          }
-        }
-      }
-      if (drained && (settled || bottomDrawn) && stripePendingDirty && canvasContext
           && canvas.width > 0 && canvas.height > 0) {
         stripeCompositePresent();
         stripePendingDirty = false;
@@ -5193,7 +5161,7 @@ let lastTick = 0;
 // Encoded webcam frames sent while the socket was down would corrupt the
 // server's decoder as deltas; held back until a keyframe restores the chain.
 let webcamChainBroken = false;
-// Video divert: 0x03/0x04 go straight to the video worker while the page
+// Video divert: 0x04 goes straight to the video worker while the page
 // keeps this on, and the newest frame id is acked from here on the same
 // cadence the page would use, so pacing and RTT stay honest through a stall.
 // Full frames ack on receipt; the striped modes ack the id the video worker
@@ -5315,7 +5283,7 @@ self.onmessage = (e) => {
       }
       if (videoPort && videoDivert && d instanceof ArrayBuffer && d.byteLength > 6) {
         const t = new Uint8Array(d, 0, 1)[0];
-        if (t === 0x03 || (t === 0x04 && d.byteLength > 10)) {
+        if (t === 0x04 && d.byteLength > 10) {
           if (videoAckSource === 'receive') {
             const head = new Uint8Array(d, 2, 2);
             videoLastId = (head[0] << 8) | head[1];
@@ -5552,7 +5520,8 @@ class WorkerWebSocket {
   _retire() {
     if (this._retiring) return;
     this._retiring = true;
-    setTimeout(() => { try { this._worker.terminate(); } catch (e) { /* already gone */ } }, 2000);
+    if (viewerCoreStopped) this._worker.terminate();
+    else globalThis.setTimeout(() => { try { this._worker.terminate(); } catch (e) { /* already gone */ } }, 2000);
   }
 }
 
@@ -5563,6 +5532,25 @@ class WorkerWebSocket {
     }
 
     if (window.isAudioInitializing) return;
+    const AudioContextImpl = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextImpl) {
+      if (!window.audioDecoderUnavailable) {
+        window.audioDecoderUnavailable = true;
+        console.warn('[Main] This browser has no Web Audio. Audio playback disabled.');
+        window.postMessage({ type: 'audioDecoderUnavailable', reason: 'no-audiocontext' }, window.location.origin);
+      }
+      return;
+    }
+    // Opus on the socket decodes through WebCodecs' AudioDecoder; without it no worker is built that would throw.
+    if (typeof AudioDecoder === 'undefined') {
+      if (!window.audioDecoderUnavailable) {
+        window.audioDecoderUnavailable = true;
+        console.warn('[Main] This browser has no AudioDecoder. Audio playback on this connection is disabled.');
+        // Without a VideoDecoder the unsupported exit says it all; with one the socket shows a silent picture.
+        if (typeof VideoDecoder !== 'undefined') window.postMessage({ type: 'audioDecoderUnavailable', reason: 'no-audiodecoder' }, window.location.origin);
+      }
+      return;
+    }
     window.isAudioInitializing = true;
 
     try {
@@ -5586,16 +5574,32 @@ class WorkerWebSocket {
       const contextOptions = {
         sampleRate: 48000
       };
-      audioContext = new(window.AudioContext || window.webkitAudioContext)(contextOptions);
+      try {
+        audioContext = new AudioContextImpl(contextOptions);
+      } catch (e) {
+        // Retried on a later audio packet (AUDIO_INIT_RETRY_MS).
+        console.warn('[Main] Could not create the playback AudioContext:', e);
+        return;
+      }
       console.log('Playback AudioContext initialized. Actual sampleRate:', audioContext.sampleRate, 'Initial state:', audioContext.state);
       audioContext.onstatechange = () => {
-        if (!audioContext) return; 
-        
+        if (!audioContext) return;
+
         console.log(`Playback AudioContext state changed to: ${audioContext.state}`);
         if (audioContext.state === 'running') {
           applyOutputDevice();
+          detachAudioUnlockListeners();
+        } else if (audioContext.state !== 'closed') {
+          // 'suspended', or iOS's non-standard 'interrupted': re-arm the
+          // gesture unlock so the next interaction brings audio back.
+          attachAudioUnlockListeners();
         }
       };
+    }
+    attachAudioLifecycleListeners();
+    if (audioContext.state !== 'running') {
+      attachAudioUnlockListeners();
+      tryResumeAudioContext('init');
     }
     try {
       const audioWorkletProcessorCode = `
@@ -5828,9 +5832,21 @@ class WorkerWebSocket {
           message
         } = event.data;
         if (type === 'decoderInitFailed') {
-          console.error(`[Main] Audio Decoder Worker failed to initialize: ${reason}`);
+          if (!window.audioDecoderUnavailable) {
+            window.audioDecoderUnavailable = true;
+            console.warn(`[Main] Audio Decoder Worker failed to initialize: ${reason}. Audio playback disabled.`);
+            window.postMessage({ type: 'audioDecoderUnavailable', reason }, window.location.origin);
+          }
         } else if (type === 'decoderError') {
           console.error(`[Main] Audio Decoder Worker reported error: ${message}`);
+          window._audioDecoderErrors = (window._audioDecoderErrors || 0) + 1;
+          if (window._audioDecoderErrors >= 10 && !window._audioErrorNotified) {
+            window._audioErrorNotified = true;
+            window.postMessage({
+              type: 'audioDecoderUnavailable',
+              reason: 'Audio decoder is experiencing repeated errors. Audio may be unavailable.',
+            }, window.location.origin);
+          }
         } else if (type === 'decoderInitialized') {
           console.log('[Main] Audio Decoder Worker confirmed its decoder is initialized.');
         } else if (type === 'decodedAudioData') {
@@ -5849,6 +5865,13 @@ class WorkerWebSocket {
         if (audioDecoderWorker) {
           audioDecoderWorker.terminate();
           audioDecoderWorker = null;
+        }
+        if (!window._audioWorkerCrashNotified) {
+          window._audioWorkerCrashNotified = true;
+          window.postMessage({
+            type: 'audioDecoderUnavailable',
+            reason: 'Audio worker crashed unexpectedly. Audio will be unavailable.',
+          }, window.location.origin);
         }
       };
       if (audioWorkletProcessorPort) {
@@ -5895,8 +5918,10 @@ class WorkerWebSocket {
     }
   }
 
-  const ws_protocol = location.protocol === 'http:' ? 'ws://' : 'wss://';
-  let websocketEndpointURL = new URL(`${ws_protocol}${window.location.host}${pathname}`);
+  // Wrapped so a dropped or never-established socket can be re-opened in
+  // place (see scheduleReconnect) without reloading the host page.
+  const connectWebSocket = () => {
+  let websocketEndpointURL = selkiesSocketEndpoint('api/websockets');
   if (isTokenAuthMode) {
       websocketEndpointURL.search = `?token=${authToken}`;
   } else if (isSharedMode) {
@@ -5911,8 +5936,10 @@ class WorkerWebSocket {
       }
       websocketEndpointURL.search = wsParams.toString();
   }
-  // Under /api like the signaling socket, so one proxy rule covers everything.
-  websocketEndpointURL.pathname += 'api/websockets';
+  // Session hook (lib/util.js): `session_peer_id` rides along after the query
+  // above, so a container that serves this socket from its WebRTC pipeline can
+  // recognise a later peer connection as the same consumer. Old servers ignore it.
+  withSessionPeerId(websocketEndpointURL);
 
   // `?socket_worker=false` keeps the socket on the page, which is also what a
   // policy forbidding blob workers leaves; the fallback below is the same path.
@@ -5934,6 +5961,28 @@ class WorkerWebSocket {
   // The socket itself is in a worker, so this handle is what page-side
   // tooling has to observe or close the transport through.
   window.selkiesTransport = websocket;
+  const connecting = websocket;
+  let socketErrorPosted = false;
+  globalThis.setTimeout(() => {
+    if (viewerCoreStopped || websocket !== connecting || connecting.readyState !== WebSocket.CONNECTING) return;
+    console.warn(`[websockets] Not connected after ${WS_CONNECT_TIMEOUT_MS} ms; retrying.`);
+    // The close handler schedules the reconnect.
+    try { connecting.close(); } catch (e) { /* closing anyway */ }
+  }, WS_CONNECT_TIMEOUT_MS);
+  // A network change leaves a socket OPEN without a reset until TCP gives up,
+  // minutes later. Its close handshake would wait as long, so the close
+  // handler runs at once.
+  let lastHeard = Date.now();
+  const silence = globalThis.setInterval(() => {
+    if (viewerCoreStopped || websocket !== connecting) { globalThis.clearInterval(silence); return; }
+    if (connecting.readyState !== WebSocket.OPEN || Date.now() - lastHeard < WS_SILENCE_TIMEOUT_MS) return;
+    globalThis.clearInterval(silence);
+    console.warn(`[websockets] Nothing received for ${WS_SILENCE_TIMEOUT_MS} ms; reconnecting.`);
+    const closed = connecting.onclose;
+    connecting.onclose = () => {};
+    try { connecting.close(); } catch (e) { /* dead anyway */ }
+    if (typeof closed === 'function') closed({ code: 1006, reason: 'silent', wasClean: false });
+  }, 2000);
   wireSocketToDecoder();
   // A fresh socket worker holds the divert default; re-point it.
   videoDivertOn = false;
@@ -5955,7 +6004,7 @@ class WorkerWebSocket {
     if (videoDivertOn) return;
     if (websocket && websocket.readyState === WebSocket.OPEN) {
       try {
-        const striped = (currentEncoderMode === 'jpeg' || currentEncoderMode === 'h264enc-striped');
+        const striped = currentEncoderMode === 'h264enc-striped';
         const fromPresent = striped && lastPresentedVideoFrameId !== null;
         const acked = fromPresent ? lastPresentedVideoFrameId : lastReceivedVideoFrameId;
         const at = fromPresent ? lastPresentedVideoFrameAt : lastReceivedVideoFrameAt;
@@ -5976,9 +6025,9 @@ class WorkerWebSocket {
 
   /**
    * Metrics tick: refreshes the audio buffer depth the backpressure gates
-   * read and publishes `window.fps` — composites presented per second in the
+   * read and publishes `window.fps` - composites presented per second in the
    * striped modes, and the wire's frame ids per second for full-frame h264enc,
-   * whose sinks present outside the page — independent of whether a dashboard
+   * whose sinks present outside the page - independent of whether a dashboard
    * is open.
    */
   const sendClientMetrics = () => {
@@ -6022,7 +6071,7 @@ class WorkerWebSocket {
       }
     }
 
-    retireCrashCountWhenHealthy();
+    retireDecoderFatalsWhenHealthy();
   };
 
   /**
@@ -6035,17 +6084,27 @@ class WorkerWebSocket {
    * requests the cache-only clipboard, and starts the metrics and ack timers.
    */
   websocket.onopen = async () => {
+    lastHeard = Date.now();
+    lastSentManualResolution = null;
     console.log('[websockets] Connection opened!');
     await settleFullColorSupport();
     wsEverOpened = true;
-    try { sessionStorage.removeItem('selkies_mode_flip'); } catch (e) { /* ignore */ }
+    // A connection succeeded: leave cold-start warmup, reset the backoff, and
+    // drop any pending retry so the next drop starts fresh.
+    reconnectAttempts = 0;
+    cancelReconnect();
+    window.postMessage({ type: 'viewer-status', status: 'connected' }, window.location.origin);
+    window.postMessage({
+      type: 'viewer-transport', transport: 'websockets', state: 'connected',
+    }, window.location.origin);
+    sessionStore.removeItem('selkies_mode_flip');
     status = 'connected_waiting_mode';
     loadingText = 'Connection established. Waiting for server mode...';
     updateStatusDisplay();
     if (typeof DecompressionStream !== 'undefined') {
       try { websocket.send('_gz,1'); } catch (e) { /* handshake is best-effort */ }
     }
-    window.postMessage({ type: 'trackpadModeUpdate', enabled: trackpadMode }, window.location.origin);
+    postTrackpadModeState(trackpadMode);
     if (!isSharedMode) {
       const settingsPrefix = `${storageAppName}_`;
       const settingsToSend = {};
@@ -6070,8 +6129,8 @@ class WorkerWebSocket {
         'video_paintover_burst_frames', 'scaling_dpi', 'video_bitrate'
       ];
 
-      for (const key in localStorage) {
-        if (Object.hasOwnProperty.call(localStorage, key) && key.startsWith(settingsPrefix)) {
+      for (const key of localStore.keys()) {
+        if (key.startsWith(settingsPrefix)) {
           const unprefixedKey = key.substring(settingsPrefix.length);
           const displaySuffix = `_${displayId}`;
           const isSpecific = displayId !== 'primary' && unprefixedKey.endsWith(displaySuffix);
@@ -6081,7 +6140,7 @@ class WorkerWebSocket {
             continue;
           }
           if (knownSettings.includes(baseKey)) {
-            let value = localStorage.getItem(key);
+            let value = localStore.getItem(key);
             if (booleanSettingKeys.includes(baseKey)) {
               value = (value === 'true');
             } else if (integerSettingKeys.includes(baseKey)) {
@@ -6111,9 +6170,6 @@ class WorkerWebSocket {
       if (settingsToSend['scaling_dpi'] === undefined) {
         settingsToSend['scaling_dpi'] = scalingDPI;
       }
-      if (detectedKeyboardLayout) {
-        settingsToSend['keyboardLayout'] = detectedKeyboardLayout;
-      }
       settingsToSend['useCssScaling'] = useCssScaling;
       settingsToSend['displayId'] = displayId;
       settingsToSend['displayScale'] = currentDisplayScale(dpr);
@@ -6135,14 +6191,20 @@ class WorkerWebSocket {
         console.log("Shared mode: WebSocket opened. Waiting for 'MODE websockets' from server to start identification sequence.");
     }
     taggedClipboardFetch.armLegacyWindow(5000);
-    websocket.send('cr');
-    console.log('[websockets] Sent initial clipboard request (cr) to server (cache-only).');
+    // The open handler runs a full settings + clipboard handshake; a transport
+    // that moved on (a follow to WebRTC, a supersede) can null the socket out
+    // from under the tail of it.
+    if (websocket && websocket.readyState === WebSocket.OPEN) {
+      websocket.send('cr');
+      console.log('[websockets] Sent initial clipboard request (cr) to server (cache-only).');
+    }
     // Each connection starts over: the server registers it by the start
     // policy, applied here again by its first server_settings payload.
     pipelinesToggledByUser.clear();
     serverSettingsReceived = false;
     pendingInitialAudioStart = false;
     isVideoPipelineActive = true;
+    videoPausedForHiddenTab = false;
     isAudioPipelineActive = (displayId === 'primary');
     window.postMessage({
       type: 'pipelineStatusUpdate',
@@ -6212,7 +6274,7 @@ class WorkerWebSocket {
 
   /**
    * Dispatches one message from the server (see the module docblock for the
-   * framing): audio to the decode worker, JPEG stripes to the JPEG decoder,
+   * framing): audio to the decode worker,
    * H.264 to the worker, main or per-stripe decoder the mode selects, and
    * every control text to its handler. Every video chunk clears the
    * START_VIDEO watchdog and bumps `window.videoChunksReceived`, the "encoded
@@ -6226,13 +6288,13 @@ class WorkerWebSocket {
       if (arrayBuffer.byteLength < 1) return;
       const dataTypeByte = dataView.getUint8(0);
 
-      if (dataTypeByte === 0x03 || dataTypeByte === 0x04) {
+      if (dataTypeByte === 0x04) {
         window.videoChunksReceived++;
         if (startVideoWatchdogTimer !== null) {
           clearStartVideoWatchdog();
         }
       }
-      if (isSharedMode && (dataTypeByte === 0x03 || dataTypeByte === 0x04)) {
+      if (isSharedMode && dataTypeByte === 0x04) {
         lastSharedVideoChunkTime = performance.now();
         sharedStallRecoveryAttempts = 0;
         sharedStallNextRecoveryTime = 0;
@@ -6240,14 +6302,14 @@ class WorkerWebSocket {
 
       if (dataTypeByte === 1) {
         if (displayId !== 'primary') return;
-        
+
         const audioHeaderLength = 2;
         if (arrayBuffer.byteLength < audioHeaderLength) return;
 
         if ((isAudioPipelineActive || isSharedMode)) {
           if (audioDecoderWorker) {
             if (audioContext && audioContext.state !== 'running') {
-              audioContext.resume().catch(e => console.error("Error resuming audio context", e));
+              tryResumeAudioContext('audio-packet');
             }
             const opusFrames = extractOpusFrames(arrayBuffer);
             for (const opusDataArrayBuffer of opusFrames) {
@@ -6265,6 +6327,10 @@ class WorkerWebSocket {
               }, [opusDataArrayBuffer]);
             }
           } else {
+            if (typeof AudioDecoder === 'undefined') return;
+            const nowMs = performance.now();
+            if ((nowMs - lastAudioInitAttemptMs) < AUDIO_INIT_RETRY_MS) return;
+            lastAudioInitAttemptMs = nowMs;
             console.warn("AudioDecoderWorker not ready. Attempting to initialize audio pipeline.");
             initializeAudio().then(() => {
               if (audioDecoderWorker) {
@@ -6278,27 +6344,8 @@ class WorkerWebSocket {
                   }, [opusDataArrayBuffer]);
                 }
               }
-            });
+            }).catch((e) => console.warn('[Main] Audio pipeline initialization failed:', e));
           }
-        }
-
-      } else if (dataTypeByte === 0x03) {
-        const jpegHeaderLength = 6;
-        if (arrayBuffer.byteLength < jpegHeaderLength) return;
-
-        const jpegFrameId = dataView.getUint16(2, false);
-        stripeClock.note(jpegFrameId);
-        if (!isSharedMode) { lastReceivedVideoFrameId = jpegFrameId; lastReceivedVideoFrameAt = performance.now(); }
-        const stripe_y_start = dataView.getUint16(4, false);
-        const jpegDataBuffer = arrayBuffer.slice(jpegHeaderLength);
-
-        const canProcessJpeg =
-          (!isSharedMode && isVideoPipelineActive && currentEncoderMode === 'jpeg') ||
-          (isSharedMode && currentEncoderMode === 'jpeg');
-
-        if (canProcessJpeg) {
-          if (jpegDataBuffer.byteLength === 0) return;
-          decodeAndQueueJpegStripe(stripe_y_start, jpegDataBuffer, jpegFrameId);
         }
 
       } else if (dataTypeByte === 0x04) {
@@ -6332,28 +6379,10 @@ class WorkerWebSocket {
             console.log(`Shared mode: stream is ${manual_width}x${manual_height} (physical).`);
             applyManualCanvasStyle(manual_width, manual_height, true);
         }
-        // Terminal, not the fallback ladder: reloading cannot conjure a
-        // decoder, and a shared viewer has no JPEG pipeline to drop to.
-        if (isSharedMode && typeof VideoDecoder === 'undefined') {
-            if (!sharedDecoderUnavailableNoticed) {
-                sharedDecoderUnavailableNoticed = true;
-                console.error('Shared viewing needs WebCodecs VideoDecoder, which this browser lacks.');
-                if (statusDisplayElement) {
-                    statusDisplayElement.textContent = 'This browser cannot decode the shared stream (no WebCodecs).';
-                    statusDisplayElement.classList.remove('hidden');
-                }
-            }
-            return;
-        }
-
-        // A keyframe still in H.264 after the JPEG rung was asked for: the
-        // server holds the encoder, and the refusal has nowhere left to go.
-        if (!isSharedMode && codecRefusalAnswered && currentEncoderMode === 'jpeg'
-            && video_frame_type_byte === 0x01 && h264Payload.byteLength > 0) {
-            answerRefusedCodec(codecFromKeyframe(h264Payload, null)
-                || getDynamicH264Codec(stripeWidth, stripeHeight, video_fullcolor, framerate));
-            return;
-        }
+        // An H.264 frame with no decoder in this browser marks the socket for every viewer, shared ones included.
+        if (socketUndecodableReason === null && typeof VideoDecoder === 'undefined') markSocketUndecodable('no-webcodecs', currentEncoderMode);
+        // Counted above as a live stream, never handed to a decoder.
+        if (socketUndecodableReason !== null) return;
 
         if (decodeInWorker && currentEncoderMode === 'h264enc' && (isSharedMode || isVideoPipelineActive)) {
             if (h264Payload.byteLength === 0) return;
@@ -6421,7 +6450,7 @@ class WorkerWebSocket {
                             return newStripeDecoder.configure(decoderConfig);
                         } else {
                             // The catch below closes the decoder while the map entry still points at it.
-                            answerRefusedCodec(dynamicCodec);
+                            answerRefusedCodec(dynamicCodec, decoderConfig.hardwareAcceleration === 'prefer-software');
                             const refusal = new Error(`config not supported: ${dynamicCodec}`);
                             refusal.quiet = true;
                             return Promise.reject(refusal);
@@ -6487,8 +6516,20 @@ class WorkerWebSocket {
     } else if (typeof event.data === 'string') {
       if (event.data.startsWith('KILL ')) {
         const reason = event.data.substring(5);
+        // The websockets service sends this KILL ahead of its "Superseded by new
+        // client" close, and the close is swallowed below: report the takeover
+        // here, the way the superseded close would. A takeover is no server fault.
+        const superseded = /^a new \S+ client connected/.test(reason);
         console.error(`Received KILL message from server: ${reason}`);
-        if (reconnectIntervalId) clearInterval(reconnectIntervalId);
+        if (!superseded) postCoreEvent('server-kill', 'websockets', reason);
+        reconnectDisabled = true;
+        cancelReconnect();
+        if (superseded && !window.__selkiesModeSwitching) {
+          freezeVideoFrame(videoElement && videoElement.videoWidth ? videoElement : canvas);
+          window.postMessage({
+            type: 'viewer-transport', transport: 'websockets', state: 'superseded', reason,
+          }, window.location.origin);
+        }
         if (websocket) {
             websocket.onclose = () => {};
             websocket.close();
@@ -6533,7 +6574,7 @@ class WorkerWebSocket {
                 manual_width = 1280; manual_height = 720;
             }
             applyManualCanvasStyle(manual_width, manual_height, true);
-            window.addEventListener('resize', () => {
+            lifecycle.listen(window, 'resize', () => {
                 if (isSharedMode && manual_width && manual_height && manual_width > 0 && manual_height > 0) {
                     applyManualCanvasStyle(manual_width, manual_height, true);
                 }
@@ -6548,7 +6589,7 @@ class WorkerWebSocket {
                      websocket.send('STOP_VIDEO');
                      setTimeout(() => {
                         if (websocket && websocket.readyState === WebSocket.OPEN) {
-                            if (document.hidden) {
+                            if (isStreamHidden()) {
                                 // Hidden on connect: stays paused until the next tab-show.
                                 sharedVideoPaused = true;
                                 console.log("Shared mode: hidden on init, leaving video paused.");
@@ -6566,7 +6607,7 @@ class WorkerWebSocket {
         const accessLevel = parseInt(event.data.split(',')[1]);
         const hasAccess = (accessLevel === 1);
         console.log(`Received MK_ACCESS update: ${hasAccess}`);
-        
+
         if (window.webrtcInput) {
             if (hasAccess) {
                 if (!window.webrtcInput.isInputAttached()) {
@@ -6619,24 +6660,16 @@ class WorkerWebSocket {
         updateStatusDisplay();
 
         if (!isTokenAuthMode) {
-            const hash = window.location.hash;
-            if (hash === '#shared') {
-                clientRole = 'viewer'; clientSlot = null;
-            } else if (hash.startsWith('#player')) {
-                clientRole = 'viewer'; clientSlot = parseInt(hash.substring(7), 10) || null;
-                // #playerN addresses slot N, the same 0-based input target an assigned slot yields.
-                if (clientSlot !== null) playerInputTargetIndex = clientSlot - 1;
-            } else {
-                clientRole = 'controller';
-                clientSlot = 1;
-                playerInputTargetIndex = 0;
-            }
+            const role = readClientRole(window.location.hash, { forcedShared: pageSharedMode() });
+            clientRole = role.role;
+            // #playerN addresses slot N, the same 0-based input target an assigned slot yields.
+            clientSlot = role.sharedType === 'shared' ? null : role.slot;
+            if (role.inputTarget !== undefined) playerInputTargetIndex = role.inputTarget;
             console.log(`Legacy mode detected. Role from hash: ${clientRole}, Slot: ${clientSlot}`);
             initializeInput();
         }
 
         clearAllVncStripeDecoders();
-        cleanupJpegStripeQueue();
         clearDecodedStripesQueue();
 
         if (!isSharedMode) {
@@ -6649,9 +6682,9 @@ class WorkerWebSocket {
             // would pin a scarce hardware decode session.
         }
 
-        initializeAudio().then(() => {
-          initializeDecoderAudio();
-        });
+        initializeAudio()
+          .then(() => initializeDecoderAudio())
+          .catch((e) => console.warn('[Main] Audio pipeline initialization failed:', e));
 
         if (isTokenAuthMode) {
             initializeInput();
@@ -6659,12 +6692,7 @@ class WorkerWebSocket {
 
         if (window.webrtcInput && typeof window.webrtcInput.setTrackpadMode === 'function') {
           window.webrtcInput.setTrackpadMode(trackpadMode);
-        }
-        if (trackpadMode) {
-          if (websocket && websocket.readyState === WebSocket.OPEN) {
-            websocket.send("SET_NATIVE_CURSOR_RENDERING,1");
-            console.log('[websockets] Applied trackpad mode on initialization.');
-          }
+          window.webrtcInput.syncCursorRendering(true);
         }
 
         if (playButtonElement) playButtonElement.classList.add('hidden');
@@ -6677,10 +6705,11 @@ class WorkerWebSocket {
             console.log("Shared mode: Received 'MODE websockets'. Requesting initial stream with STOP/START_VIDEO. State: ready.");
             armSharedStallWatchdog();
             if (websocket && websocket.readyState === WebSocket.OPEN) {
+                 websocket.send(DESKTOP_CONTROL_STATUS);
                  websocket.send('STOP_VIDEO');
                  setTimeout(() => {
                     if (websocket && websocket.readyState === WebSocket.OPEN) {
-                        if (document.hidden) {
+                        if (isStreamHidden()) {
                             // Hidden on connect: stays paused until the next tab-show.
                             sharedVideoPaused = true;
                             console.log("Shared mode: hidden on init, leaving video paused.");
@@ -6693,6 +6722,8 @@ class WorkerWebSocket {
             }
         } else {
             if (websocket && websocket.readyState === WebSocket.OPEN) {
+              // Input is wired from here on: ask for the agent/human control state.
+              websocket.send(DESKTOP_CONTROL_STATUS);
               // The server sends server_settings only after MODE, so the
               // payload has not been seen yet when this runs. Hold the
               // initial request until it arrives, otherwise a policy of
@@ -6708,12 +6739,37 @@ class WorkerWebSocket {
         initializationComplete = true;
         if (firstFrameRecoveryTimer !== null) clearInterval(firstFrameRecoveryTimer);
         let firstFrameNudges = 0;
+        let firstFrameResetDone = false;
+        const firstFrameChunksAtStart = window.videoChunksReceived;
         firstFrameRecoveryTimer = setInterval(() => {
-          if (streamStarted || !isVideoPipelineActive || !websocket || websocket.readyState !== WebSocket.OPEN || firstFrameNudges >= 5) {
+          const state = {
+              exhausted: firstFrameNudges >= 5,
+              painted: hasPaintedFrame,
+              hidden: isStreamHidden(),
+              stopped: viewerCoreStopped,
+              // Runtime hook (lib/runtime-config.js): the transport that owns this core.
+              ending: runtimeConfig().transport?.isEnding() === true,
+              superseded: runtimeConfig().transport?.isSuperseded() === true,
+              pipelineActive: isVideoPipelineActive,
+              socketOpen: !!websocket && websocket.readyState === WebSocket.OPEN,
+              undecodable: socketUndecodableReason !== null,
+              chunksArrived: window.videoChunksReceived > firstFrameChunksAtStart,
+              resetDone: firstFrameResetDone,
+            };
+          const recovery = decideFirstFrameRecovery(state);
+          if (recovery === 'reset') {
+            // H.264 arrived but nothing painted: the decoders are rebuilt once on the next keyframe.
+            firstFrameResetDone = true;
+            console.warn('H.264 arrived but produced no first frame; rebuilding the decoders.');
+            restartDecoders();
+            return;
+          }
+          if (recovery === 'stop') {
             clearInterval(firstFrameRecoveryTimer);
             firstFrameRecoveryTimer = null;
             return;
           }
+          if (recovery === 'wait') return;
           firstFrameNudges++;
           console.log(`No frame since connect; requesting keyframe (attempt ${firstFrameNudges}).`);
           requestKeyframe();
@@ -6746,25 +6802,22 @@ class WorkerWebSocket {
                       websocket.onclose = () => {};
                       websocket.close();
                   }
-                  if (reconnectIntervalId) {
-                      clearInterval(reconnectIntervalId);
-                      reconnectIntervalId = null;
-                  }
+                  reconnectDisabled = true;
+                  cancelReconnect();
                   return;
               }
+              applyStreamProfile(obj.settings.stream_profile, isSharedMode || displayId !== 'primary');
               const changes = sanitizeAndStoreSettings(obj.settings);
-              if (typeof window['encoder'] === 'string' && !canDecodeEncoder(window['encoder'])) {
-                  showUndecodableEncoderNotice(window['encoder']);
+              if (typeof window['encoder'] === 'string' && typeof VideoDecoder === 'undefined') {
+                  markSocketUndecodable('no-webcodecs', window['encoder']);
               } else if (typeof window['encoder'] === 'string' && window['encoder'] !== currentEncoderMode) {
                   const newEnc = window['encoder'];
-                  clearUndecodableEncoderNotice();
                   console.log(`Server settings switch encoder ${currentEncoderMode} -> ${newEnc}.`);
                   currentEncoderMode = newEnc;
                   updateVideoDivert();
                   if (newEnc !== 'h264enc-striped') {
                       clearAllVncStripeDecoders();
                   }
-                  cleanupJpegStripeQueue();
                   clearDecodedStripesQueue();
               }
               if (Number.isFinite(parseInt(window['framerate'], 10))) {
@@ -6786,6 +6839,7 @@ class WorkerWebSocket {
               if (!serverSettingsReceived) {
                 serverSettingsReceived = true;
                 applyStartPolicy(obj.settings);
+                if (isStreamHidden()) handleStreamVisibility({ immediate: true });
               }
               if (pendingInitialAudioStart) {
                   pendingInitialAudioStart = false;
@@ -6959,6 +7013,8 @@ class WorkerWebSocket {
                console.warn(`Received invalid stream_resolution dimensions: ${obj.width}x${obj.height}`);
              }
            }
+         } else if (obj.type === 'desktop_control') {
+           postDesktopControl(obj);
          } else {
             console.warn(`Unexpected JSON message type:`, obj.type, obj);
           }
@@ -7006,8 +7062,7 @@ class WorkerWebSocket {
                             const isFreshContent = clipboardSync.shouldSend(text, 'text/plain');
                             clipboardSync.resolveServer(text, null, 'text/plain');
                             if (!isInitClipboardFetch && clipboard_out_enabled && isFreshContent) {
-                                deferredClipboardWriter.write(
-                                    () => navigator.clipboard.writeText(text), {
+                                deferredClipboardWriter.writeText(text, {
                                         onFailure: (err) => console.error('Could not copy server clipboard text to local: ' + err),
                                     });
                             }
@@ -7089,8 +7144,7 @@ class WorkerWebSocket {
                 const isFreshContent = clipboardSync.shouldSend(decodedText, 'text/plain');
                 clipboardSync.resolveServer(decodedText, null, 'text/plain');
                 if (writeLocal && isFreshContent) {
-                    deferredClipboardWriter.write(
-                        () => navigator.clipboard.writeText(decodedText), {
+                    deferredClipboardWriter.writeText(decodedText, {
                             onFailure: (err) => console.error('Could not copy server clipboard to local: ' + err),
                         });
                 }
@@ -7104,7 +7158,13 @@ class WorkerWebSocket {
         } else if (event.data.startsWith('system,')) {
           try {
             const systemMsg = JSON.parse(event.data.substring(7));
-            if (systemMsg.action === 'reload') window.location.reload();
+            if (systemMsg.action === 'reload') {
+              // Re-open the stream socket instead of reloading: the viewer is
+              // one route of a single-page app that owns the page lifecycle.
+              if (!viewerCoreStopped && websocket) {
+                try { websocket.close(); } catch (e) { /* already closing */ }
+              }
+            }
             else if (typeof systemMsg.action === 'string' &&
                 systemMsg.action.startsWith('command_error,') && !isSharedMode) {
               // Surfaced in the warning channel, or the optimistic UI reads as success.
@@ -7244,6 +7304,7 @@ class WorkerWebSocket {
 
   /** Inflates 0x05 frames and routes everything through `__rawWsMessage` in order (see `__wsCtrlChain`). */
   websocket.onmessage = (event) => {
+    lastHeard = Date.now();
     const d = event.data;
     if (d instanceof ArrayBuffer) {
       if (d.byteLength >= 1 && new Uint8Array(d, 0, 1)[0] === 0x05) {
@@ -7271,7 +7332,12 @@ class WorkerWebSocket {
   };
 
   websocket.onerror = (event) => {
+    window.postMessage({ type: 'viewer-status', status: 'error' }, window.location.origin);
     console.error('[websockets] Error:', event);
+    if (!socketErrorPosted) {
+      socketErrorPosted = true;
+      postCoreEvent('websocket-error', wsEverOpened ? 'after-open' : 'never-opened', isSharedMode ? 'shared' : 'controller');
+    }
     status = 'error';
     loadingText = 'WebSocket connection error.';
     updateStatusDisplay();
@@ -7298,12 +7364,21 @@ class WorkerWebSocket {
    */
   websocket.onclose = (event) => {
     console.log('[websockets] Connection closed', event);
+    window.postMessage({ type: 'viewer-status', status: 'disconnected' }, window.location.origin);
+    window.__BROWSER_LOL_STREAMING__ = false;
+    // Re-arm the per-connection latches so a successful in-place reconnect runs
+    // the whole start-stream handshake again and re-posts 'streaming'; without
+    // this startStream() short-circuits and the host spinner never clears.
+    streamStarted = false;
+    hasPaintedFrame = false;
+    initializationComplete = false;
     // The auth probe reloads the page when the origin now answers 401.
     if (window.__selkiesAuthProbe) window.__selkiesAuthProbe();
     if (event.code === 4001) {
         console.error("Server rejected connection: Invalid token. Disabling reconnect.");
-        if (reconnectIntervalId) clearInterval(reconnectIntervalId);
-        reconnectIntervalId = null;
+        postCoreEvent('invalid-token', 'websockets', event.reason);
+        reconnectDisabled = true;
+        cancelReconnect();
         loadingText = 'Connection Failed: Invalid Token';
         updateStatusDisplay();
         return;
@@ -7313,8 +7388,18 @@ class WorkerWebSocket {
     const superseded = /superseded/i.test(event.reason || '');
     if (superseded) {
         console.warn("Session superseded by a new connection. Auto-reconnect disabled.");
-        if (reconnectIntervalId) clearInterval(reconnectIntervalId);
-        reconnectIntervalId = null;
+        reconnectDisabled = true;
+        cancelReconnect();
+        // The page turns this into a "take control" prompt over the last frame;
+        // reconnecting here would make the two tabs trade the session forever.
+        if (!window.__selkiesModeSwitching) {
+          // Whichever surface this mode paints into.
+          freezeVideoFrame(videoElement && videoElement.videoWidth ? videoElement : canvas);
+          window.postMessage({
+            type: 'viewer-transport', transport: 'websockets', state: 'superseded',
+            reason: event.reason || 'superseded',
+          }, window.location.origin);
+        }
     }
     status = 'disconnected';
     loadingText = superseded
@@ -7330,7 +7415,7 @@ class WorkerWebSocket {
       backpressureIntervalId = null;
     }
     releaseWakeLock();
-    cleanupJpegStripeQueue();
+    clearDecodedStripesQueue();
     clearAllVncStripeDecoders();
     deactivateStripeWorker();
     if (audioDecoderWorker) {
@@ -7353,76 +7438,175 @@ class WorkerWebSocket {
         sharedClientState = 'idle';
         clearSharedStallWatchdog();
     }
-    if (!superseded && !reconnectIntervalId) {
-      reconnectIntervalId = setInterval(() => {
-        if (websocket && (websocket.readyState === WebSocket.OPEN || websocket.readyState === WebSocket.CONNECTING)) {
-        } else {
-          console.log("WebSocket disconnected, reloading page to reconnect.");
-          reloadPossiblyFlippingMode();
-        }
-      }, 5000);
+    if (!superseded) {
+      reportWebsocketsUnreachable();
+      scheduleReconnect();
     }
   };
+  };
+
+  /**
+   * Re-opens the stream socket with bounded exponential backoff. Guards
+   * against scheduling twice, reconnecting after the viewer was stopped, and
+   * racing a socket that is already (re)connecting.
+   */
+  scheduleReconnect = () => {
+    if (reconnectDisabled || viewerCoreStopped) return;
+    if (reconnectTimeoutId) return;
+    if (websocket && (websocket.readyState === WebSocket.OPEN || websocket.readyState === WebSocket.CONNECTING)) return;
+    const base = wsEverOpened ? RECONNECT_BASE_MS : RECONNECT_COLD_BASE_MS;
+    const cap = wsEverOpened ? RECONNECT_MAX_MS : RECONNECT_COLD_MAX_MS;
+    const delay = Math.min(cap, base * Math.pow(2, reconnectAttempts));
+    reconnectAttempts += 1;
+    console.log(`[websockets] Reconnecting stream socket in ${delay}ms (attempt ${reconnectAttempts}).`);
+    reconnectTimeoutId = setTimeout(() => {
+      reconnectTimeoutId = null;
+      if (reconnectDisabled || viewerCoreStopped) return;
+      if (websocket && (websocket.readyState === WebSocket.OPEN || websocket.readyState === WebSocket.CONNECTING)) return;
+      try {
+        connectWebSocket();
+      } catch (err) {
+        console.error('[websockets] Reconnect failed to start, retrying:', err);
+        scheduleReconnect();
+      }
+    }, delay);
+  };
+
+  connectWebSocket();
 }
+
+/** Assigned by initWebsockets(); a no-op before the socket exists. */
+let scheduleReconnect = () => {};
 
 let wsEverOpened = false;
 
 /**
- * Reloads the page, first switching the stored stream mode to WebRTC when the
- * server is serving that transport: a plain GET on the transport endpoint
- * answers 409 exactly then. One attempt per connect cycle, and only if this
- * session never connected, so a client whose stored mode disagrees with the
- * server converges instead of loop-reloading.
+ * Reports that the data socket cannot be established, so transport.ts
+ * can decide what to do. Upstream reloads the page here after probing for a
+ * 409 (server serving the other transport); our viewer is one route of a
+ * single-page app whose session state a reload would throw away, so the
+ * decision (probe, `POST /api/switch`, retry) belongs to the controller and
+ * this only hands it the fact at once (the socket is down from now on) and
+ * again when the probe finds the server serving WebRTC only.
  */
-async function reloadPossiblyFlippingMode() {
-  let flipGuard = null;
-  try { flipGuard = sessionStorage.getItem('selkies_mode_flip'); } catch (e) { /* ignore */ }
-  if (!wsEverOpened && !flipGuard) {
-    try {
-      // The same path derivation as the data socket, so the probe hits its route.
-      const probeURL = new URL(window.location.href);
-      probeURL.pathname = getRoutePrefix() + '/api/websockets';
-      const res = await fetch(probeURL.href, { cache: 'no-store', headers: sessionAuthHeaders() });
-      if (res.status === 409) {
-        try { sessionStorage.setItem('selkies_mode_flip', '1'); } catch (e) { /* ignore */ }
-        safeSetItem(`${storageAppName}_stream_mode`, 'webrtc');
-        console.warn('[websockets] Server is serving WebRTC (endpoint 409); switching stored mode.');
-      }
-    } catch (e) { /* unreachable server: plain reload below keeps retrying */ }
-  }
-  location.reload();
-}
-
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initWebsockets);
-} else {
-  initWebsockets();
+async function reportWebsocketsUnreachable() {
+  const postFailed = (serverMode) => window.postMessage({
+    type: 'viewer-transport',
+    transport: 'websockets',
+    state: 'failed',
+    everConnected: wsEverOpened,
+    serverMode,
+  }, window.location.origin);
+  postFailed('unknown');
+  // Probed on every failure, not only the first: a container that restarts its
+  // stream service comes back in its provisioned SELKIES_MODE, so a session
+  // that HAD a socket is exactly the case where the mode changed underneath.
+  try {
+    const res = await fetch(selkiesEndpoint('api/websockets').href,
+      { cache: 'no-store', headers: sessionAuthHeaders() });
+    if (res.status === 409) postFailed('webrtc');
+  } catch (e) { /* unreachable server: the reconnect scheduler keeps retrying */ }
 }
 
 /**
- * Closes every queued JPEG stripe image and resets the frame-boundary blit
- * latch, which stale would blit the previous mode's back-buffer once.
+ * Entry point. The host page imports this module dynamically, so the document
+ * has usually finished loading by then and the upstream DOMContentLoaded
+ * listener would never fire.
  */
-function cleanupJpegStripeQueue() {
-  let closedCount = 0;
-  while (jpegStripeRenderQueue.length > 0) {
-    const segment = jpegStripeRenderQueue.shift();
-    if (segment && segment.image && typeof segment.image.close === 'function') {
-      try {
-        segment.image.close();
-        closedCount++;
-      } catch (e) {
-        /* ignore */
-      }
-    }
+function startViewerCore() {
+  // Runtime hook (lib/runtime-config.js): a page that stopped its viewer keeps a late start down.
+  if (!runtimeConfig().shouldStart) return;
+  if (lifecycle.disposed) return;
+  if (!clipboardWorker) clipboardWorker = new ClipboardWorkerBridge();
+  lifecycle.listen(window, 'message', receiveMessage, false);
+  lifecycle.listen(window, 'beforeunload', stopViewerCore);
+  viewerCoreStopped = false;
+  // stopViewerCore() disables reconnects; a restarted core needs them back.
+  reconnectDisabled = false;
+  window.postMessage({ type: 'viewer-status', status: 'initializing' }, window.location.origin);
+  if (healthLogIntervalId === null) {
+    healthLogIntervalId = setInterval(logConnectionHealth, HEALTH_LOG_INTERVAL_MS);
   }
-  if (closedCount > 0) console.log(`Cleanup: Closed ${closedCount} JPEG stripe images.`);
-  lastDrawnJpegStripeFrameId = {};
-  stripePendingFrameId = null;
-  stripePendingDirty = false;
+  if (document.readyState === 'loading') {
+    lifecycle.listen(document, 'DOMContentLoaded', initWebsockets);
+  } else {
+    initWebsockets();
+  }
 }
 
-/** Closes every decoded stripe awaiting the paint loop. */
+/** Tears the session down for good; the host page calls this when it unmounts the viewer. */
+function stopViewerCore() {
+  if (lifecycle.disposed) return;
+
+  viewerCoreStopped = true;
+  reconnectDisabled = true;
+  cancelReconnect();
+  if (healthLogIntervalId) { clearInterval(healthLogIntervalId); healthLogIntervalId = null; }
+  detachAudioUnlockListeners();
+  detachAudioLifecycleListeners();
+  window.__BROWSER_LOL_STREAMING__ = false;
+  cleanup();
+  ownedStyle?.remove();
+  ownedStyle = null;
+  activeClipboardGestures?.unwire();
+  deferredClipboardWriter.dispose();
+  activeClipboardGestures = null;
+  clipboardWorker?.terminate();
+  clipboardWorker = null;
+  deactivateVideoWorker();
+  deactivateMstg();
+  lifecycle.dispose();
+  firstFrameRecoveryTimer = null;
+  startVideoWatchdogTimer = null;
+  // The viewer is a route of a single-page app, so its DOM and listeners must
+  // go with it; upstream only ever tears down on a page unload.
+  window.removeEventListener('resize', setRealViewportHeight);
+  window.removeEventListener('message', receiveMessage, false);
+  if (originalWindowResizeHandler) window.removeEventListener('resize', originalWindowResizeHandler);
+  // Upgrade hook (transport.ts): this core's OWN input instance, never
+  // `window.webrtcInput`. During a sink-to-WebRTC upgrade the global points at
+  // the other core's instance, and detaching that one would leave the session
+  // that is taking over without keyboard, mouse or touch.
+  const input = ownedInputInstance;
+  if (input) {
+    const cursorDiv = input.cursorDiv;
+    try {
+      if (typeof input.detach === 'function') input.detach();
+    } catch (e) {
+      console.error('Cleanup error detaching input:', e);
+    }
+    if (cursorDiv && cursorDiv.parentNode) cursorDiv.parentNode.removeChild(cursorDiv);
+    if (window.webrtcInput === input) window.webrtcInput = null;
+    ownedInputInstance = null;
+  }
+  // Upgrade hook (transport.ts): only the nodes this core created. The
+  // `#app` element is the page's, and a `replaceChildren()` on it would detach
+  // the other core's `.video-container` (with its `<video id="stream">`) and
+  // remove the keyboard assist that instance reuses.
+  for (const node of [ownedKeyboardAssist, ownedVideoContainer]) {
+    if (node) node.remove();
+  }
+  ownedKeyboardAssist = null;
+  ownedVideoContainer = null;
+  canvas = null;
+  canvasContext = null;
+  videoElement = null;
+  statusDisplayElement = null;
+  playButtonElement = null;
+  overlayInput = null;
+  inputInitialized = false;
+  initializationComplete = false;
+}
+
+window.stopBrowserLolViewer = stopViewerCore;
+
+startViewerCore();
+
+/**
+ * Closes every decoded stripe awaiting the paint loop and resets the
+ * frame-boundary blit latch, which stale would blit the previous mode's
+ * back-buffer once.
+ */
 function clearDecodedStripesQueue() {
   while (decodedStripesQueue.length > 0) {
     const stripeData = decodedStripesQueue.shift();
@@ -7583,20 +7767,29 @@ const audioDecoderWorkerCode = `
 
   async function handleDecodedAudioFrameInWorker(frame) {
     currentDecodeQueueSize = Math.max(0, currentDecodeQueueSize - 1);
-    if (!frame || typeof frame.copyTo !== 'function' || typeof frame.allocationSize !== 'function' || typeof frame.close !== 'function') {
+    if (!frame || typeof frame.copyTo !== 'function' || typeof frame.close !== 'function') {
         if(frame && typeof frame.close === 'function') { try { frame.close(); } catch(e) { /* ignore */ } }
         return;
     }
     let pcmDataArrayBuffer;
     try {
-      const requiredByteLength = frame.allocationSize({ planeIndex: 0, format: 'f32' });
+      const channels = frame.numberOfChannels;
+      const samples = frame.numberOfFrames;
+      const requiredByteLength = samples * channels * Float32Array.BYTES_PER_ELEMENT;
       if (requiredByteLength === 0) {
           try { frame.close(); } catch(e) { /* ignore */ }
           return;
       }
       pcmDataArrayBuffer = new ArrayBuffer(requiredByteLength);
       const pcmDataView = new Float32Array(pcmDataArrayBuffer);
-      await frame.copyTo(pcmDataView, { planeIndex: 0, format: 'f32' });
+      // WebKit can crash when copyTo requests interleaved audio. Copy each plane instead.
+      const plane = new Float32Array(samples);
+      for (let channel = 0; channel < channels; channel++) {
+        frame.copyTo(plane, { planeIndex: channel, format: 'f32-planar' });
+        for (let sample = 0; sample < samples; sample++) {
+          pcmDataView[sample * channels + channel] = plane[sample];
+        }
+      }
       if (pcmPort) pcmPort.postMessage({ audioData: pcmDataArrayBuffer }, [pcmDataArrayBuffer]);
       else self.postMessage({ type: 'decodedAudioData', pcmBuffer: pcmDataArrayBuffer }, [pcmDataArrayBuffer]);
       pcmDataArrayBuffer = null;
@@ -7763,9 +7956,13 @@ async function startMicrophoneCapture() {
     postSidebarButtonUpdate();
     return;
   }
-  if (isMicrophoneActive || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    if (!isMicrophoneActive) isMicrophoneActive = false;
+  if (isMicrophoneActive) {
     postSidebarButtonUpdate();
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    postSidebarButtonUpdate();
+    postMicrophoneError({ name: 'NotSupportedError', message: 'getUserMedia is unavailable' });
     return;
   }
   let constraints;
@@ -7843,9 +8040,17 @@ async function startMicrophoneCapture() {
     postSidebarButtonUpdate();
   } catch (error) {
     console.error('Failed to start microphone capture:', error);
-    alert(`Microphone error: ${error.name} - ${error.message}`);
     stopMicrophoneCapture();
+    postMicrophoneError(error);
   }
+}
+
+/** Tells the page why the microphone did not start; the page shows it at its control. */
+function postMicrophoneError(error) {
+  window.postMessage({
+    type: 'microphoneError',
+    error: { name: (error && error.name) || 'Error', message: (error && error.message) || '' },
+  }, window.location.origin);
 }
 
 /** Stops the microphone uplink and releases the stream, worklet, worker and context. */
@@ -7982,6 +8187,10 @@ function stopWebcamCapture() {
 
 /** Tears everything down on unload: timers, capture, socket, audio, decoders and buffers, then resets the UI state. */
 function cleanup() {
+  viewerCoreStopped = true;
+  cancelReconnect();
+  detachAudioUnlockListeners();
+  detachAudioLifecycleListeners();
   if (metricsIntervalId) {
     clearInterval(metricsIntervalId);
     metricsIntervalId = null;
@@ -8015,18 +8224,19 @@ function cleanup() {
     window.currentAudioBufferSize = 0;
     if (audioDecoderWorker) {
       audioDecoderWorker.postMessage({ type: 'close' });
-      audioDecoderWorker.terminate(); 
+      audioDecoderWorker.terminate();
       audioDecoderWorker = null;
     }
   }
-  cleanupJpegStripeQueue();
+  clearDecodedStripesQueue();
   clearAllVncStripeDecoders();
   preferredInputDeviceId = null;
   preferredOutputDeviceId = null;
   status = 'connecting';
   loadingText = '';
-  showStart = true;
+  showStart = false;
   streamStarted = false;
+  hasPaintedFrame = false;
   inputInitialized = false;
   if (statusDisplayElement) statusDisplayElement.textContent = 'Connecting...';
   if (statusDisplayElement) statusDisplayElement.classList.remove('hidden');
@@ -8060,7 +8270,6 @@ function performServerInitiatedVideoReset(reason = "unknown") {
   if (websocket && typeof websocket.resetVideoAck === 'function') websocket.resetVideoAck();
   console.log(`  Reset lastReceivedVideoFrameId to ${lastReceivedVideoFrameId}.`);
 
-  cleanupJpegStripeQueue();
   clearDecodedStripesQueue();
 
   if (currentEncoderMode === 'h264enc' || currentEncoderMode === 'h264enc-striped') {
@@ -8096,13 +8305,13 @@ function requestKeyframe() {
 }
 
 /**
- * Rebuilds every video decoder so a changed acceleration preference takes
- * hold, then resyncs from a fresh IDR. The main decoder is only fed in shared
- * mode; the stripe and worker decoders are rebuilt from the next keyframe by
- * the paths that own them, and a worker decoder disqualified by the same
- * broken path gets its turn back.
+ * Rebuilds every video decoder (a changed acceleration preference, a first
+ * frame that never came), then resyncs from a fresh IDR. The main decoder is
+ * only fed in shared mode; the stripe and worker decoders are rebuilt from the
+ * next keyframe by the paths that own them, and a worker decoder disqualified
+ * by the same broken path gets its turn back.
  */
-function restartDecodersForAcceleration() {
+function restartDecoders() {
     workerDecoderCodec = null; workerDecoderW = 0; workerDecoderH = 0;
     workerKeyframeCodec = null;
     workerDecodeFailed = false;
@@ -8115,31 +8324,32 @@ function restartDecodersForAcceleration() {
 }
 
 /**
- * The decoder fallback ladder. A codec reclaimed by the browser is a soft
+ * The decoder fallback. A codec reclaimed by the browser is a soft
  * error left to the tab-focus re-init. A decoder that accepted its config and
  * then failed is the signature of a broken hardware path, so the first hard
  * error retries the same encoder on software decode; errors from the decoders
  * that switch replaced are absorbed for a settle period. A failure after that
- * forgets the preference, counts a crash, and reloads: a shared viewer just
- * resyncs, a controller resets its settings to safe defaults, stepping the
- * encoder down to h264enc and, at three crashes, to jpeg. jpeg mode runs no
- * VideoDecoder, so an error there is handover noise from a stream the server
- * has yet to stop and never escalates.
+ * forgets the preference and posts `decoder-fatal` (left in sessionStorage
+ * too, for the page the reload brings up). The first one in a tab reloads (a
+ * shared viewer resyncs, a controller resets its settings to safe defaults
+ * with the h264enc encoder); the next one marks the socket undecodable
+ * (`no-h264`), so the WebRTC window and the unsupported exit decide.
  * @param {Error|DOMException} error
  * @param {string} context Which decoder failed.
  */
 function initiateFallback(error, context) {
+    // The socket already shows nothing here: what its torn-down decoders still report changes nothing.
+    if (socketUndecodableReason !== null) return;
     if (error.name === 'QuotaExceededError' || (error.message && error.message.includes('reclaimed'))) {
         console.warn(`[initiateFallback] Ignoring soft error (Context: ${context}): Codec reclaimed by browser. Waiting for tab focus to re-initialize.`);
         return;
     }
-    if (!softwareDecodeAttempted && !window.isFallingBack &&
-        currentEncoderMode !== 'jpeg') {
+    if (!softwareDecodeAttempted && !window.isFallingBack) {
         softwareDecodeAttempted = true;
         softwareDecodeSwitchedAt = performance.now();
         console.warn(`[initiateFallback] Decoder error (Context: ${context}); retrying on software decode.`, error);
         rememberSoftwareDecode(true);
-        restartDecodersForAcceleration();
+        restartDecoders();
         return;
     }
     if (performance.now() - softwareDecodeSwitchedAt < SOFTWARE_DECODE_SETTLE_MS) {
@@ -8149,7 +8359,19 @@ function initiateFallback(error, context) {
     console.error(`FATAL DECODER ERROR (Context: ${context}).`, error);
     if (window.isFallingBack) return;
     window.isFallingBack = true;
+    // The row offset stays out of the reason, which keys the log aggregation.
+    const fatalReason = String(context).replace(/_Y=\d*$/, '');
+    const fatalDetail = [error.name, error.message].filter(Boolean).join(': ');
+    postCoreEvent('decoder-fatal', fatalReason, fatalDetail);
     rememberSoftwareDecode(false);
+    const decoderFatals = parseInt(sessionStore.getItem(DECODER_FATAL_KEY) || '0', 10) || 0;
+    if (decoderFatals >= DECODER_FATAL_RELOADS) {
+        // A reload already failed to help in this tab: another one would loop.
+        markSocketUndecodable('no-h264', `decoder-fatal: ${fatalReason}`);
+        window.isFallingBack = false;
+        return;
+    }
+    sessionStore.setItem(DECODER_FATAL_KEY, String(decoderFatals + 1));
     if (websocket && websocket.readyState === WebSocket.OPEN) {
         websocket.onclose = null;
         websocket.close();
@@ -8166,41 +8388,28 @@ function initiateFallback(error, context) {
         }
     } else {
         console.log("Primary client fallback: Forcing client settings to safe defaults.");
-        let crashCount = parseInt(window.localStorage.getItem(CRASH_COUNT_KEY) || '0');
-        crashCount++;
-        safeSetItem(CRASH_COUNT_KEY, crashCount.toString());
-        if (crashCount >= 3) {
-            setStringParam('encoder', 'jpeg');
-            safeSetItem(CRASH_COUNT_KEY, '0');
-        } else if (currentEncoderMode !== 'jpeg') {
-            setStringParam('encoder', 'h264enc');
-        } else {
-            // Un-escalating from jpeg would loop the ladder on builds whose
-            // WebCodecs claims H.264 support but fails at decode().
-            safeSetItem(CRASH_COUNT_KEY, '0');
-        }
+        setStringParam('encoder', 'h264enc');
         setBoolParam('video_fullcolor', false);
         setIntParam('framerate', 60);
         setIntParam('video_crf', 25);
         setBoolParam('manual_resolution', false);
         setIntParam('manual_width', null);
         setIntParam('manual_height', null);
-        
+
         if (statusDisplayElement) {
             statusDisplayElement.textContent = 'A critical video error occurred. Resetting to default settings and reloading...';
             statusDisplayElement.classList.remove('hidden');
         }
     }
     setTimeout(() => {
+        if (viewerCoreStopped) return;
+        rememberCoreReload('decoder-fatal', fatalReason, fatalDetail);
         window.location.reload();
     }, 3000);
 }
 
 /**
- * Builds the UI and checks the engine: a secure context is required; without
- * WebCodecs the stream is pinned to the jpeg encoder, which decodes through
- * createImageBitmap, and a server-locked H.264 encoder is reported when it
- * arrives rather than decoded into a crash loop.
+ * Builds the UI and checks for a secure context.
  * @returns {boolean} False when the page cannot run.
  */
 function runPreflightChecks() {
@@ -8212,45 +8421,34 @@ function runPreflightChecks() {
             statusDisplayElement.classList.remove('hidden');
         }
         if (playButtonElement) playButtonElement.classList.add('hidden');
+        window.postMessage({ type: 'browserUnsupported', reason: 'insecure-context' }, window.location.origin);
         return false;
-    }
-
-    if (typeof window.VideoDecoder === 'undefined') {
-        console.warn("VideoDecoder API unavailable: the stream is pinned to the jpeg encoder.");
-        pinJpegEncoder();
-    } else {
-        console.log("Pre-flight checks passed: Secure context and VideoDecoder API are available.");
     }
     return true;
 }
 
-/** Pins the jpeg encoder, the fallback ladder's last rung. */
-function pinJpegEncoder() {
-    currentEncoderMode = 'jpeg';
-    setStringParam('encoder', 'jpeg');
-}
-
-let undecodableEncoderNoticeShown = false;
 /**
- * Reports a server-locked encoder this engine cannot decode instead of showing nothing.
- * @param {string} encoderName
+ * Marks the socket undecodable here for the life of this core: H.264 frames are dropped before any
+ * decoder, the core event goes out once, and transport.ts hears it on every call so WebRTC gets its window.
  */
-function showUndecodableEncoderNotice(encoderName) {
-    console.error(`Encoder ${encoderName} needs the WebCodecs API, which this browser lacks.`);
-    if (statusDisplayElement) {
-        statusDisplayElement.textContent = 'Error: The session streams an encoder this browser cannot decode without the WebCodecs API.';
-        statusDisplayElement.classList.remove('hidden');
+function markSocketUndecodable(reason, detail) {
+    if (socketUndecodableReason === null) {
+        socketUndecodableReason = reason;
+        console.warn(`This browser cannot decode the socket stream (${reason}: ${detail}); WebRTC may still show it.`);
+        postCoreEvent('unsupported-codec', reason, detail);
+        clearAllVncStripeDecoders();
+        clearDecodedStripesQueue();
+        updateVideoDivert();
+        if (statusDisplayElement) {
+            statusDisplayElement.textContent = 'Error: This browser cannot decode the video of this session.';
+            statusDisplayElement.classList.remove('hidden');
+        }
     }
-    undecodableEncoderNoticeShown = true;
+    window.postMessage({
+        type: 'viewer-transport', transport: 'websockets', state: 'undecodable', reason: socketUndecodableReason,
+    }, window.location.origin);
 }
 
-/** Hides the undecodable-encoder notice once a decodable encoder is in use. */
-function clearUndecodableEncoderNotice() {
-    if (!undecodableEncoderNoticeShown) return;
-    undecodableEncoderNoticeShown = false;
-    if (statusDisplayElement) statusDisplayElement.classList.add('hidden');
-}
 
-window.addEventListener('beforeunload', cleanup);
 window.webrtcInput = null;
 }

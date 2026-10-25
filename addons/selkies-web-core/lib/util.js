@@ -1,4 +1,4 @@
-/*
+/*!
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -95,23 +95,6 @@ export const DISPLAY_LABELS = {
  */
 export const displayLabel = (value) => DISPLAY_LABELS[value] ?? value;
 
-/**
- * Whether this engine can play an encoder on the WebSocket transport: every
- * H.264 mode decodes through WebCodecs' `VideoDecoder`, while `jpeg` (striped
- * JPEG painted through `createImageBitmap`) needs nothing. An engine without
- * WebCodecs therefore still streams: the core's pre-flight pins `jpeg` instead
- * of failing, and the settings offer nothing it cannot play. The WebRTC
- * transport decodes in the browser's media stack and is not subject to this.
- * @param {string} encoder An encoder wire value.
- * @returns {boolean}
- */
-export const canDecodeEncoder = (encoder) => encoder === "jpeg" || typeof VideoDecoder !== "undefined";
-/**
- * @param {string[]} encoders Encoder wire values.
- * @returns {string[]} Those `canDecodeEncoder` accepts.
- */
-export const decodableEncoders = (encoders) => encoders.filter(canDecodeEncoder);
-
 /** Cached answer of `canDecodeFullColor`, so the probe runs once. */
 let fullColorProbe = null;
 
@@ -190,3 +173,78 @@ export const isMobileClient =
     typeof window !== 'undefined' &&
     typeof window.matchMedia === 'function' &&
     window.matchMedia('(pointer: coarse)').matches;
+
+/**
+ * Absolute URL of one Selkies endpoint (`api/websockets`, `api/ws`,
+ * `api/turn`, `api/switch`).
+ *
+ * Our client is served by the product frontend, not by the container, so the
+ * route prefix derived from `window.location` names the frontend and not the
+ * session. `window.SELKIES_BASE_URL` is the per-session base the integration
+ * publishes (`https://<backend host>/selkies/<vmId>`), and only when it is
+ * absent does this fall back to the upstream same-origin derivation.
+ * @param {string} path Endpoint path, with or without a leading slash.
+ * @returns {URL}
+ */
+export function selkiesEndpoint(path) {
+    const suffix = String(path).replace(/^\//, '');
+    const base = (typeof window !== 'undefined' && window.SELKIES_BASE_URL) || '';
+    if (base) {
+        return new URL(suffix, base.endsWith('/') ? base : `${base}/`);
+    }
+    const url = new URL(window.location.href);
+    url.pathname = `${getRoutePrefix()}/${suffix}`;
+    url.search = '';
+    url.hash = '';
+    return url;
+}
+
+/**
+ * `selkiesEndpoint` as a WebSocket URL: same origin, `ws`/`wss` scheme.
+ * @param {string} path
+ * @returns {URL}
+ */
+export function selkiesSocketEndpoint(path) {
+    const url = selkiesEndpoint(path);
+    url.protocol = url.protocol === 'http:' ? 'ws:' : 'wss:';
+    return url;
+}
+
+/**
+ * The viewer's session peer id, published by `transport.ts` before either
+ * core loads.
+ *
+ * Both wire endpoints carry it: the `/api/websockets` query and the signaling
+ * `HELLO` metadata. A container that serves the WebSocket sink from its WebRTC
+ * pipeline uses it to recognise a socket client and a peer connection as ONE
+ * consumer, so a viewer upgrading from the socket to WebRTC hands its consumer
+ * entry over instead of being superseded (close 4001). Older containers ignore
+ * the extra query parameter and the extra metadata key.
+ * @returns {?string}
+ */
+export function sessionPeerId() {
+    try {
+        const id = typeof window !== 'undefined' ? window.SELKIES_SESSION_PEER_ID : null;
+        return typeof id === 'string' && id ? id : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Adds `session_peer_id` to a socket URL, after whatever query the caller built.
+ *
+ * Appended as a string rather than through `searchParams.set`, which
+ * re-serialises the WHOLE query in the form-urlencoded style (`+` for a space,
+ * different escaping of `:` and `/`). The query it is appended to carries the
+ * session token, which the container compares verbatim, so the pre-existing
+ * bytes have to survive untouched.
+ * @param {URL} url
+ * @returns {URL} The same url, for chaining.
+ */
+export function withSessionPeerId(url) {
+    const query = String(url.search || '').replace(/^\?/, '');
+    const pair = `session_peer_id=${encodeURIComponent(sessionPeerId())}`;
+    url.search = query ? `${query}&${pair}` : pair;
+    return url;
+}

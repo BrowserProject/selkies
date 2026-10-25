@@ -1,4 +1,4 @@
-/*
+/*!
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -15,11 +15,17 @@
  * focus-driven local-to-server path, `createDeferredClipboardWriter` lands
  * server pushes on engines that reject clipboard writes outside a user
  * activation, `localClipboardBlocker` names what stops a local write at all,
+ * `configureClipboardCommandGate` holds server text that looks like a command
+ * the page wants run (a product option, off unless configured),
  * and `createClipboardGestures` wires the copy and paste keystrokes. The transports differ only in the hooks they inject: how a
  * request or payload is sent and the enablement gates, which are closures
- * re-read per event so runtime settings changes apply immediately.
+ * re-read per event so runtime settings changes apply immediately. What has
+ * been synced is the page's one `pageClipboardSyncState`, since both
+ * transports reach the same session clipboard.
  * @module
  */
+
+import { compileClipboardRules, matchClipboardCommand } from './clipboard-command.js';
 
 /**
  * @typedef {{kind: 'text', text: string}|{kind: 'image', blob: Blob, mime: string}} LocalClipboardContent
@@ -279,6 +285,33 @@ export function createTaggedClipboardFetch() {
 }
 
 /**
+ * @typedef {object} ClipboardSyncState
+ * @property {string|null} syncedSig Signature of the value both ends hold,
+ *     the latest synced in either direction.
+ * @property {string|null} reencodeSig The browser's re-encoded form of the
+ *     latest inbound image, living as long as `syncedSig`.
+ * @property {Promise<void>|null} initialPush The connect-time push in flight.
+ */
+
+/** @returns {ClipboardSyncState} A state with nothing synced. */
+export function createClipboardSyncState() {
+    return { syncedSig: null, reencodeSig: null, initialPush: null };
+}
+
+/**
+ * The page's sync state, shared by the socket and the WebRTC core: both reach
+ * the same session clipboard, so what one synced is current for the other and
+ * a handover never uploads it again. The transport resets it for each session
+ * it starts.
+ */
+export const pageClipboardSyncState = createClipboardSyncState();
+
+/** Forgets what the page synced, so a new session starts from nothing. */
+export function resetPageClipboardSync() {
+    Object.assign(pageClipboardSyncState, createClipboardSyncState());
+}
+
+/**
  * How long a push the user asked for keeps precedence over a focus read once
  * it has settled: long enough to cover the refocus the file picker raises as
  * it closes, far too short to contain a trip to another window and back.
@@ -303,7 +336,10 @@ const EXPLICIT_PRECEDENCE_MS = 1000;
  * until the send settles. `maybeInitial` covers a focused Chromium tab, which
  * gets no `focus` event after connect and would otherwise leave the server on
  * its stale clipboard until the first alt-tab; it runs only when clipboard
- * read is already granted, since it must never raise a prompt at load.
+ * read is already granted, since it must never raise a prompt at load. Each
+ * core runs it once per connection, after the other core's push in flight:
+ * a value that push completed is synced and not sent again, one a handover
+ * cut off is sent once more.
  *
  * `sendExplicit` carries the dashboard's own pushes -- the clipboard box and
  * the image upload -- and outranks a read while it runs and briefly after:
@@ -325,6 +361,8 @@ const EXPLICIT_PRECEDENCE_MS = 1000;
  *     and dedupes at the server.
  * @param {(() => (Promise<*>|null))|null} [hooks.getDeferredWriteInFlight]
  *     The deferred writer's pending write, awaited before reading.
+ * @param {ClipboardSyncState} [hooks.syncState] Where the connect-time push
+ *     in flight is shared; the cores pass `pageClipboardSyncState`.
  * @returns {LocalClipboardSender}
  */
 export function createLocalClipboardSender({
@@ -336,6 +374,7 @@ export function createLocalClipboardSender({
     sendClipboardData,
     dedupeText = false,
     getDeferredWriteInFlight = null,
+    syncState = createClipboardSyncState(),
 }) {
     let sendInFlight = null;
     let lastText = null;
@@ -433,8 +472,14 @@ export function createLocalClipboardSender({
         if (!navigator.permissions || !navigator.permissions.query) return;
         try {
             const st = await navigator.permissions.query({ name: 'clipboard-read' });
-            if (st.state === 'granted') readAndSend();
-        } catch (_) { /* permission name unsupported (non-Chromium engines) */ }
+            if (st.state !== 'granted') return;
+        } catch (_) { return; /* permission name unsupported (non-Chromium engines) */ }
+        while (syncState.initialPush) await syncState.initialPush;
+        const push = readAndSend().finally(() => {
+            if (syncState.initialPush === push) syncState.initialPush = null;
+        });
+        syncState.initialPush = push;
+        await push;
     }
 
     return { readAndSend, sendExplicit, maybeInitial, getSendInFlight: () => sendInFlight };
@@ -445,6 +490,8 @@ export function createLocalClipboardSender({
  * @property {(attempt: () => Promise<void>, callbacks?: {onSuccess?: () => void, onFailure?: (err: Error) => void}) => Promise<boolean>} write
  *     Runs an async clipboard write now, stashing it for the next gesture on
  *     an activation rejection.
+ * @property {(text: string, callbacks?: {onSuccess?: () => void, onFailure?: (err: Error) => void}) => Promise<boolean>} writeText
+ *     Writes server text through the command gate, then like `write`.
  * @property {() => void} flush Retries the stashed write.
  * @property {() => (Promise<boolean>|null)} getInFlight The most recent
  *     attempt, immediate or flushed, or `null`.
@@ -473,6 +520,7 @@ export function createDeferredClipboardWriter() {
     let pending = null;
     let writeSeq = 0;
     let inFlight = null;
+    let disposed = false;
 
     function isActivationError(err) {
         return !!err && (err.name === 'NotAllowedError' || err.name === 'SecurityError');
@@ -494,9 +542,10 @@ export function createDeferredClipboardWriter() {
      * an async one does, instead of throwing past `onFailure`.
      */
     function attemptOnce(w) {
-        return Promise.resolve().then(() => w.attempt()).then(
-            () => { if (w.onSuccess) w.onSuccess(); return true; },
+        return Promise.resolve().then(() => disposed ? false : w.attempt()).then(
+            () => { if (disposed) return false; if (w.onSuccess) w.onSuccess(); return true; },
             (err) => {
+                if (disposed) return false;
                 if (isActivationError(err)) {
                     if (!pending || pending.seq < w.seq) pending = w;
                     return false;
@@ -516,7 +565,8 @@ export function createDeferredClipboardWriter() {
     for (const type of ['pointerdown', 'keydown', 'focus']) {
         window.addEventListener(type, flush, true);
     }
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) flush(); }, true);
+    const onVisible = () => { if (!document.hidden) flush(); };
+    document.addEventListener('visibilitychange', onVisible, true);
 
     /**
      * Runs `attempt` now; on an activation or focus rejection queues it for
@@ -524,12 +574,211 @@ export function createDeferredClipboardWriter() {
      * `onFailure` only for non-activation errors.
      */
     function write(attempt, { onSuccess, onFailure } = {}) {
+        if (disposed) return Promise.resolve(false);
         const p = attemptOnce({ attempt, onSuccess, onFailure, seq: ++writeSeq });
         track(p);
         return p;
     }
 
-    return { write, flush, getInFlight: () => inFlight };
+    /**
+     * The one way server text reaches the local clipboard: text the command
+     * gate holds is not written here, only after the visitor chooses to copy
+     * it anyway.
+     */
+    function writeText(text, callbacks) {
+        if (!screenClipboardText(text)) return Promise.resolve(false);
+        return write(() => navigator.clipboard.writeText(text), callbacks);
+    }
+
+    function dispose() {
+        disposed = true;
+        pending = null;
+        inFlight = null;
+        for (const type of ['pointerdown', 'keydown', 'focus']) window.removeEventListener(type, flush, true);
+        document.removeEventListener('visibilitychange', onVisible, true);
+    }
+
+    return { write, writeText, flush, dispose, getInFlight: () => inFlight };
+}
+
+/** Longest part of a held command the warning shows, in characters. */
+export const CLIPBOARD_HOLD_PREVIEW_LIMIT = 2000;
+/** Waits before each renewed rule load while the gate has none, in ms; bounded. */
+export const CLIPBOARD_RULES_RETRY_MS = [2000, 5000, 15000, 30000, 60000];
+/** After the retries, a screened text reloads missing rules at most this often, in ms. */
+export const CLIPBOARD_RULES_SCREEN_RETRY_MS = 60 * 1000;
+
+/**
+ * @typedef {object} ClipboardCommandGate
+ * @property {(text: string) => boolean} screen True when the text may be
+ *     written now; false when it is held for the visitor's decision.
+ * @property {(text: string) => boolean} flags Whether the gate would hold the
+ *     text, without holding or announcing it.
+ * @property {() => void} dispose Drops the held text and the listener.
+ */
+
+/**
+ * Holds server clipboard text that looks like a command the page wants the
+ * visitor to paste into Run, Terminal or PowerShell (ClickFix).
+ *
+ * A flagged text is not written. The page is told with a
+ * `clipboardCommandHeld` message (severity, kinds, terms and a bounded copy
+ * of the text for the warning) and answers with `clipboardCommandDecision`
+ * `{id, copy}`; only `copy: true` writes it, through a deferred writer so a
+ * rejected activation lands on the next gesture. The newest held text wins,
+ * the same text is announced once while it is held, and a text the visitor
+ * chose to copy passes from then on. A different text that passes, or the
+ * gate's end, drops the held one and posts `clipboardCommandCleared` `{id,
+ * reason}`, so a late "copy" can never overwrite newer clipboard content.
+ * While the gate has no rules it reloads them on a bounded backoff, then at
+ * most every CLIPBOARD_RULES_SCREEN_RETRY_MS when text is screened; until
+ * they arrive the matcher's structural core still applies.
+ * @param {object} options
+ * @param {(() => Promise<unknown>)=} options.loadRules The analyzer's rule set.
+ * @param {(message: object) => void} [options.post] Page notification.
+ * @param {EventTarget} [options.target] Where decisions arrive.
+ * @param {string} [options.origin] The only origin a decision is taken from.
+ * @param {{write: DeferredClipboardWriter['write'], dispose?: () => void}} [options.writer]
+ * @param {(text: string) => Promise<void>} [options.writeLocal] The local write.
+ * @param {(fn: () => void, ms: number) => unknown} [options.schedule] Timer seam.
+ * @param {(handle: unknown) => void} [options.cancel] Timer seam.
+ * @param {() => number} [options.now] Clock seam.
+ * @returns {ClipboardCommandGate}
+ */
+export function createClipboardCommandGate({
+    loadRules,
+    post = (message) => window.postMessage(message, window.location.origin),
+    target = window,
+    origin = window.location.origin,
+    writer = createDeferredClipboardWriter(),
+    writeLocal = (text) => navigator.clipboard.writeText(text),
+    schedule = (fn, ms) => setTimeout(fn, ms),
+    cancel = (handle) => clearTimeout(handle),
+    now = () => Date.now(),
+}) {
+    let rules = null;
+    let held = null;
+    let allowed = null;
+    let seq = 0;
+    let disposed = false;
+    let loading = false;
+    let retries = 0;
+    let retryTimer = null;
+    let lastLoad = 0;
+    let memo = null;
+
+    function loadMissingRules() {
+        if (!loadRules || disposed || rules || loading || retryTimer !== null) return;
+        loading = true;
+        lastLoad = now();
+        Promise.resolve().then(loadRules).then(compileClipboardRules, () => null).then((compiled) => {
+            loading = false;
+            if (disposed) return;
+            if (compiled) {
+                rules = compiled;
+                memo = null;
+            } else if (retries < CLIPBOARD_RULES_RETRY_MS.length) {
+                retryTimer = schedule(() => { retryTimer = null; loadMissingRules(); }, CLIPBOARD_RULES_RETRY_MS[retries++]);
+            }
+        });
+    }
+    loadMissingRules();
+
+    function match(text) {
+        if (!memo || memo.text !== text) memo = { text, match: matchClipboardCommand(text, rules) };
+        return memo.match;
+    }
+
+    function clearHeld(reason) {
+        if (!held) return;
+        const { id } = held;
+        held = null;
+        post({ type: 'clipboardCommandCleared', id, reason });
+    }
+
+    function onMessage(event) {
+        if (event.origin !== origin) return;
+        const data = event.data;
+        if (!data || data.type !== 'clipboardCommandDecision' || !held || data.id !== held.id) return;
+        const { text } = held;
+        held = null;
+        if (data.copy !== true) return;
+        allowed = text;
+        writer.write(() => writeLocal(text));
+    }
+    target.addEventListener('message', onMessage);
+
+    function flags(text) {
+        return !disposed && typeof text === 'string' && text !== allowed && !!match(text);
+    }
+
+    function screen(text) {
+        if (disposed || typeof text !== 'string') return true;
+        if (!rules && now() - lastLoad >= CLIPBOARD_RULES_SCREEN_RETRY_MS) loadMissingRules();
+        const found = text === allowed ? null : match(text);
+        if (!found) {
+            if (held && held.text !== text) clearHeld('replaced');
+            return true;
+        }
+        if (held && held.text === text) return false;
+        held = { id: `clipboard-command-${++seq}`, text };
+        post({
+            type: 'clipboardCommandHeld',
+            id: held.id,
+            severity: found.severity,
+            kinds: found.kinds,
+            terms: found.terms,
+            command: text.slice(0, CLIPBOARD_HOLD_PREVIEW_LIMIT),
+            truncated: text.length > CLIPBOARD_HOLD_PREVIEW_LIMIT,
+        });
+        return false;
+    }
+
+    function dispose() {
+        clearHeld('stopped');
+        disposed = true;
+        memo = null;
+        if (retryTimer !== null) cancel(retryTimer);
+        retryTimer = null;
+        target.removeEventListener('message', onMessage);
+        if (writer.dispose) writer.dispose();
+    }
+
+    return { screen, flags, dispose };
+}
+
+let commandGate = null;
+
+/**
+ * Turns the command gate on for this page (`options`) or off (`null`). A
+ * product option: guard.ch configures it through the transport, browser.lol
+ * never does, and every server text then passes untouched.
+ * @param {Parameters<typeof createClipboardCommandGate>[0]|null} options
+ */
+export function configureClipboardCommandGate(options) {
+    if (commandGate) commandGate.dispose();
+    commandGate = options ? createClipboardCommandGate(options) : null;
+}
+
+/**
+ * Whether server clipboard text may be written locally now. Every
+ * server-to-local text write asks this first: the deferred writer's
+ * `writeText` and the non-Chromium copy gesture.
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function screenClipboardText(text) {
+    return commandGate ? commandGate.screen(text) : true;
+}
+
+/**
+ * Whether the command gate would hold this server text. Read-only: it holds
+ * and announces nothing, so the dashboards can mark a preview.
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function clipboardTextFlagged(text) {
+    return commandGate ? commandGate.flags(text) : false;
 }
 
 /** Longest server clipboard text the dashboards are shown, in characters. */
@@ -543,17 +792,21 @@ export const CLIPBOARD_PREVIEW_LIMIT = 256 * 1024;
  * controlled textarea, freezing the page, while the UI only needs a bounded
  * preview. The `truncated` flag tells the dashboard to render it read-only so
  * a blur cannot echo the cut-down text back over the real server clipboard.
+ * `held` is set only when the command gate flags the text, so the dashboard
+ * warns instead of showing it as ordinary clipboard content.
  * @param {string} text The server clipboard text.
- * @returns {{type: string, text: string, truncated: boolean, totalLength: number}}
+ * @returns {{type: string, text: string, truncated: boolean, totalLength: number, held?: true}}
  */
 export function clipboardPreviewMessage(text) {
     const truncated = text.length > CLIPBOARD_PREVIEW_LIMIT;
-    return {
+    const message = {
         type: 'clipboardContentUpdate',
         text: truncated ? text.slice(0, CLIPBOARD_PREVIEW_LIMIT) : text,
         truncated,
         totalLength: text.length,
     };
+    if (clipboardTextFlagged(text)) message.held = true;
+    return message;
 }
 
 /**
@@ -599,18 +852,20 @@ export function clipboardPreviewMessage(text) {
  * @param {() => void} hooks.sendRequest Emits REQUEST_CLIPBOARD on the transport.
  * @param {boolean} [hooks.isChromium] Engine flag; the image read-back is Chromium-only.
  * @param {() => boolean} [hooks.canRead] Local-to-server direction enabled.
+ * @param {ClipboardSyncState} [hooks.syncState] Where the synced value lives;
+ *     the cores pass `pageClipboardSyncState`.
  * @returns {ClipboardSync}
  */
-export function createClipboardSync({ sendRequest, digestBytes, isChromium = true, canRead = () => true }) {
+export function createClipboardSync({
+    sendRequest, digestBytes, isChromium = true, canRead = () => true, syncState = createClipboardSyncState(),
+}) {
     let lastText = '';
     let lastBlob = null;
     let lastMime = 'text/plain';
-    let lastSyncedSig = null;
-    let lastReencodeSig = null;
     let pending = [];
     function noteSynced(s) {
-        lastSyncedSig = s;
-        lastReencodeSig = null;
+        syncState.syncedSig = s;
+        syncState.reencodeSig = null;
     }
 
     function hashBytes(h, u8) {
@@ -663,8 +918,9 @@ export function createClipboardSync({ sendRequest, digestBytes, isChromium = tru
      */
     function shouldSend(data, mime) {
         const { full, legacy } = sigOf(data, mime);
-        if (full === lastSyncedSig || full === lastReencodeSig) return false;
-        return !(legacy !== null && (legacy === lastSyncedSig || legacy === lastReencodeSig));
+        const { syncedSig, reencodeSig } = syncState;
+        if (full === syncedSig || full === reencodeSig) return false;
+        return !(legacy !== null && (legacy === syncedSig || legacy === reencodeSig));
     }
 
     /** Records content as synced; called on transfer success. */
@@ -715,7 +971,7 @@ export function createClipboardSync({ sendRequest, digestBytes, isChromium = tru
         // It reads the local clipboard, so the local-to-server direction has
         // to be enabled for it as much as for the focus read.
         if (!isChromium || !canRead()) return;
-        const anchor = lastSyncedSig;
+        const anchor = syncState.syncedSig;
         try {
             const items = await navigator.clipboard.read();
             for (const it of items) {
@@ -725,8 +981,8 @@ export function createClipboardSync({ sendRequest, digestBytes, isChromium = tru
                 const buf = await b.arrayBuffer();
                 const digest = digestBytes ? await digestBytes(buf) : null;
                 const reencoded = sig(digest || new Uint8Array(buf), m);
-                if (lastSyncedSig === anchor) {
-                    lastReencodeSig = reencoded;
+                if (syncState.syncedSig === anchor) {
+                    syncState.reencodeSig = reencoded;
                 }
                 return;
             }
@@ -964,7 +1220,8 @@ export function createClipboardGestures({
      * whether the server's current clipboard is an image, and a stale cached
      * MIME type would build a malformed ClipboardItem. Server images are
      * delivered by the push handler instead. Autorepeat is ignored so it
-     * cannot spam REQUEST_CLIPBOARD.
+     * cannot spam REQUEST_CLIPBOARD. Text the command gate holds rejects the
+     * item and the fallback alike, so nothing is written.
      * @param {KeyboardEvent} event
      */
     function onCopyKeydown(event) {
@@ -974,11 +1231,16 @@ export function createClipboardGestures({
         if (inPageFormField()) return;
         const key = (event.key || '').toLowerCase();
         if (key === 'c' && canWrite()) {
-            const textPromise = clipboardSync.request(false);
-            const items = {
-                'text/plain': textPromise.then((t) =>
-                    new Blob([typeof t === 'string' ? t : (clipboardSync.lastText || '')], { type: 'text/plain' }))
-            };
+            const textPromise = clipboardSync.request(false).then((t) => {
+                const text = typeof t === 'string' ? t : (clipboardSync.lastText || '');
+                if (!screenClipboardText(text)) throw new Error('Server clipboard text held by the command gate');
+                return text;
+            });
+            const blobPromise = textPromise.then((t) => new Blob([t], { type: 'text/plain' }));
+            // Only the browser's ClipboardItem consumes it, and not at all when
+            // the write throws: its failure is handled through textPromise.
+            blobPromise.catch(() => {});
+            const items = { 'text/plain': blobPromise };
             let writePromise = null;
             try {
                 writePromise = navigator.clipboard.write([new ClipboardItem(items)]);

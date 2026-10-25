@@ -131,15 +131,18 @@ export function createEncodePace() {
 /**
  * Staleness of the oldest frame sent to the encoder and not yet answered by
  * a chunk; answering settles everything up to its timestamp, so an encoder
- * that quietly discards inputs is not held to them. Stringified into the
- * encode worker: keep it self-contained apart from `PACE_LAG_INTERVALS`.
+ * that quietly discards inputs is not held to them.
+ * Bundle hook (ENCODE_WORKER_SRC): stringified into the encode worker, so it
+ * is self-contained and takes what it needs as parameters; anything from
+ * module scope would arrive there minified and unbound.
  * @param {number} fps Capture rate the budget is scaled by.
+ * @param {number} lagIntervals Frame intervals of lag the budget allows (`PACE_LAG_INTERVALS`).
  * @returns {{budgetMs: number, sent: function(number, number): void,
  *   answered: function(number): void, lagMs: function(number): number,
  *   reset: function(): void}}
  */
-export function createLagGauge(fps) {
-  const budgetMs = (PACE_LAG_INTERVALS * 1000) / (fps > 0 ? fps : 30);
+export function createLagGauge(fps, lagIntervals) {
+  const budgetMs = (lagIntervals * 1000) / (fps > 0 ? fps : 30);
   let pending = [];
   return {
     budgetMs,
@@ -308,7 +311,7 @@ async function makeEncoder(w, h, latched) {
       });
       enc.configure(support.config || encoderConfig(cand, w, h));
       encoder = enc; encodedSize = { w: w, h: h, rotation: latched.rotation, flip: latched.flip };
-      lag = createLagGauge(fps);
+      lag = createLagGauge(fps, PACE_LAG_INTERVALS);
       forceKeyframe = true; configuring = false;
       self.postMessage({ type: 'ready', codec: cand.name });
       return true;
@@ -716,11 +719,23 @@ export class WebcamCapture {
     if (deviceId) {
       video.deviceId = { exact: deviceId };
     }
+    const startGeneration = this._generation;
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
     } catch (error) {
       this._onError(error);
+      return;
+    }
+    if (this._generation !== startGeneration) {
+      // stop() ran while the permission prompt was open.
+      stream.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch (e) {
+          /* ignore */
+        }
+      });
       return;
     }
     const track = stream.getVideoTracks()[0];
@@ -770,10 +785,12 @@ export class WebcamCapture {
 
   /** Stops the capture and releases the camera, encoder and workers; idempotent. */
   stop() {
+    // Bumped before the early return: a start() still awaiting getUserMedia
+    // has nothing set yet, and must still see its generation go stale.
+    this._generation++;
     if (!this._active && !this._stream) {
       return;
     }
-    this._generation++;
     this._active = false;
     this._stopEncodeWorker();
     if (this._source) {

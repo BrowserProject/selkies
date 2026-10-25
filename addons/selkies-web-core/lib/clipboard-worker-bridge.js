@@ -13,7 +13,22 @@
  * as a string.
  * @module
  */
-import ClipboardWorker from '../clipboard-worker.js?worker&inline';
+import { CLIPBOARD_WORKER_SOURCE } from '../clipboard-worker.js';
+
+// Bundle hook (clipboard-worker.js): the apps bundle the engine, so the worker
+// runs from its exported source in a Blob instead of a file addressed by URL; a
+// worker file a deploy replaced would answer 404 in the middle of a session.
+function ClipboardWorker() {
+    // Classic worker on purpose: the source has no imports, and a module worker
+    // is unsupported on older Firefox and Safari. The Worker keeps its own
+    // reference to the script, so the object URL is revoked at once.
+    const url = URL.createObjectURL(new Blob([CLIPBOARD_WORKER_SOURCE], { type: 'text/javascript' }));
+    try {
+        return new Worker(url);
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
 
 /**
  * Request/response bridge to the clipboard worker.
@@ -26,12 +41,26 @@ export class ClipboardWorkerBridge {
         this.worker = null;
         this.callbacks = new Map();
         this.msgId = 0;
+        /** Set once the worker failed to load or died; callers fall back to the main thread. */
+        this.failed = false;
     }
 
     /** Creates the worker when it does not exist yet. */
     init() {
+        if (this.failed) return;
         if (!this.worker) {
-            this.worker = new ClipboardWorker();
+            try {
+                this.worker = ClipboardWorker();
+            } catch (e) {
+                this._fail(e instanceof Error ? e : new Error('Clipboard worker unavailable'));
+                return;
+            }
+            this.worker.onerror = (e) => {
+                this._fail(new Error(e && e.message ? e.message : 'Clipboard worker error'));
+            };
+            this.worker.onmessageerror = () => {
+                this._fail(new Error('Clipboard worker message could not be deserialized'));
+            };
             this.worker.onmessage = (e) => {
                 const { id, success, result, error, mimeType, byteLength, hash } = e.data;
                 const resolveReject = this.callbacks.get(id);
@@ -46,6 +75,26 @@ export class ClipboardWorkerBridge {
             };
             console.log("Clipboard Web Worker initialized.");
         }
+    }
+
+    /**
+     * Marks the worker unusable and rejects every pending request.
+     *
+     * A worker that never loads would otherwise leave every clipboard promise
+     * pending forever, which stalls the paste hold; rejecting sends callers
+     * down their documented main-thread path instead.
+     * @param {Error} err
+     */
+    _fail(err) {
+        this.failed = true;
+        if (this.worker) {
+            try { this.worker.terminate(); } catch (e) { /* already gone */ }
+        }
+        this.worker = null;
+        const pendingCallbacks = Array.from(this.callbacks.values());
+        this.callbacks.clear();
+        for (const { reject } of pendingCallbacks) reject(err);
+        console.warn('Clipboard Web Worker unavailable; using the main thread:', err);
     }
 
     /** Stops the worker and rejects every pending request with an `AbortError`. */
@@ -70,6 +119,10 @@ export class ClipboardWorkerBridge {
     async encodeText(text) {
         this.init();
         return new Promise((resolve, reject) => {
+            if (!this.worker) {
+                reject(new Error('Clipboard worker unavailable'));
+                return;
+            }
             const id = ++this.msgId;
             this.callbacks.set(id, { resolve, reject });
             this.worker.postMessage({ id, action: 'ENCODE_TEXT_TO_B64', payload: text });
@@ -88,6 +141,10 @@ export class ClipboardWorkerBridge {
     async encodeBinary(arrayBuffer, hash) {
         this.init();
         return new Promise((resolve, reject) => {
+            if (!this.worker) {
+                reject(new Error('Clipboard worker unavailable'));
+                return;
+            }
             const id = ++this.msgId;
             this.callbacks.set(id, { resolve, reject });
             this.worker.postMessage(
@@ -105,6 +162,10 @@ export class ClipboardWorkerBridge {
     async hashBytes(arrayBuffer) {
         this.init();
         return new Promise((resolve, reject) => {
+            if (!this.worker) {
+                reject(new Error('Clipboard worker unavailable'));
+                return;
+            }
             const id = ++this.msgId;
             this.callbacks.set(id, { resolve, reject });
             this.worker.postMessage({ id, action: 'HASH_BYTES', payload: arrayBuffer }, [arrayBuffer]);
@@ -119,6 +180,10 @@ export class ClipboardWorkerBridge {
     async reencodePng(blob) {
         this.init();
         return new Promise((resolve, reject) => {
+            if (!this.worker) {
+                reject(new Error('Clipboard worker unavailable'));
+                return;
+            }
             const id = ++this.msgId;
             this.callbacks.set(id, { resolve, reject });
             this.worker.postMessage({ id, action: 'REENCODE_PNG', payload: blob });
@@ -133,6 +198,10 @@ export class ClipboardWorkerBridge {
     async decode(base64String, mimeType) {
         this.init();
         return new Promise((resolve, reject) => {
+            if (!this.worker) {
+                reject(new Error('Clipboard worker unavailable'));
+                return;
+            }
             const id = ++this.msgId;
             this.callbacks.set(id, { resolve, reject });
             this.worker.postMessage({ id, action: 'DECODE_FROM_B64', payload: base64String, mimeType });
@@ -150,6 +219,13 @@ export class ClipboardWorkerBridge {
      */
     decodeStream(mimeType) {
         this.init();
+        if (!this.worker) {
+            return {
+                push: () => {},
+                finish: () => Promise.reject(new Error('Clipboard worker unavailable')),
+                abort: () => {},
+            };
+        }
         const id = ++this.msgId;
         this.worker.postMessage({ id, action: 'DECODE_BEGIN', mimeType });
         return {

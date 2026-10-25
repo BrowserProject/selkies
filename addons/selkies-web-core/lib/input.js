@@ -1,4 +1,4 @@
-/*
+/*!
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -47,22 +47,28 @@
  * plus pointer and keyboard lock. Touch is direct (tap, drag, long-press right
  * click, two-finger scroll) or a trackpad emulation. Wheel events are
  * classified as discrete wheel or trackpad and accumulated in fractional
- * notches so no distance is lost. The server-drawn cursor is painted on a
- * page canvas or applied as a CSS cursor.
+ * notches so no distance is lost. The server's cursor shape is painted on a
+ * page canvas or applied as a CSS cursor at the local pointer.
  *
  * Wire messages: `kd,<keysym>`, `ku,<keysym>`, `kh,<keysym>,...`, `kr`;
  * `m,<x>,<y>,<mask>,<magnitude>` (absolute) and
  * `m2,<dx>,<dy>,<mask>,<magnitude>` (relative; scroll pulses ride mask bits
- * 3 to 7); `p,<0|1>` and `SET_NATIVE_CURSOR_RENDERING,<0|1>` on pointer lock
- * changes; `js,c`, `js,d`, `js,b`, `js,a` and `js,h` for gamepads.
+ * 3 to 7); `p,<0|1>` on pointer lock changes; `SET_NATIVE_CURSOR_RENDERING,<0|1>`
+ * when the server starts or stops compositing the pointer; `js,c`, `js,d`, `js,b`, `js,a` and `js,h` for gamepads.
  * @module
  */
 
 import { GamepadManager } from './gamepad.js';
 import { Queue } from './util.js';
 
+
 /** CSS class on elements (and their descendants) whose input stays native. */
 const WHITELIST_CLASS = 'allow-native-input';
+
+const TRACKPAD = Object.freeze({
+    moveSlop: 1, tapSlop: 5, tapMs: 600, doubleTapMs: 300, longPressMs: 600,
+    scrollSlop: 8, scrollStep: 24, pinchSlop: 24, pinchStep: 30, gain: 0.85
+});
 
 /**
  * A `MouseEvent.buttons` bitmask in the wire's numbering, which counts buttons
@@ -1325,6 +1331,11 @@ const _stopEvent = function (e) {
  * Ctrl+Shift+Click takes pointer lock. Elements carrying the
  * `allow-native-input` class keep native keyboard and touch handling.
  */
+// The mobile keyboard assist field is primed with this char so soft keyboards
+// (which suppress key events for an empty field) still emit a deletion we can
+// translate into a remote Backspace.
+const KBD_ASSIST_SENTINEL = ' ';
+
 export class Input {
     /**
      * @param {HTMLElement} element Overlay element the stream input lands on; it also hosts IME composition.
@@ -1393,6 +1404,7 @@ export class Input {
         this.listeners_context = [];
         this._queue = new Queue();
         this._allowTrackpadScrolling = true;
+        this._wheelFlushTimer = null;
         /**
          * Whether wheel input is classified as a trackpad. Starts true until
          * the detector has its samples: the throttle path never drops events,
@@ -1473,9 +1485,19 @@ export class Input {
         this._trackpadTouches = new Map();
         this._trackpadLastTapTime = 0;
         this._trackpadGestureMode = null;
-        this._trackpadTapTimeout = null;
         this._trackpadLastScrollCentroid = null;
+        this._trackpadTwoFingerMode = null;
+        this._trackpadTwoFingerStart = null;
+        this._trackpadPinchLastDist = 0;
+        this._trackpadCtrlHeld = false;
+        this._trackpadLongPressTimer = null;
+        this._tapReleaseTimer = null;
         this._touchScrollLastCentroid = null;
+        this._lastTouchActivityTime = 0;
+        /** Whether touch (rather than a mouse or pen) moved the pointer last. */
+        this._touchDrives = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+        /** Whether the server composites the pointer into the picture (last value sent; off on a new connection). */
+        this._serverCursor = false;
         this.inputAttached = false;
     }
 
@@ -1594,41 +1616,78 @@ export class Input {
     }
 
     /**
-     * Applies a cursor update from the server; an empty or null-handle update,
-     * and trackpad mode, hide the cursor.
+     * Applies a cursor update from the server; an empty or null-handle update
+     * hides the cursor. The shape is kept while the server draws the pointer,
+     * so a mouse taking over shows it again at once.
      * @param {{curdata?: string, handle: string|number, hotx?: string|number, hoty?: string|number}} cursorData
      *     Base64 PNG and hotspot as the server sends them.
      */
     async updateServerCursor(cursorData) {
-        if (!cursorData.curdata ||
-            parseInt(cursorData.handle, 10) === 0 ||
-            this._trackpadMode)
-        {
-            this._cursorImageBitmap = null;
+        this._cursorImageBitmap = null;
+        if (!cursorData.curdata || parseInt(cursorData.handle, 10) === 0) {
             this._cursorBase64Data = null;
-            this.cursorDiv.style.display = 'none';
-            if (this.use_browser_cursors) {
-                this.element.style.setProperty('cursor', 'none', 'important');
-            }
-            return;
+        } else {
+            this._rawHotspotX = parseInt(cursorData.hotx) || 0;
+            this._rawHotspotY = parseInt(cursorData.hoty) || 0;
+            this._cursorBase64Data = cursorData.curdata;
         }
-        this._rawHotspotX = parseInt(cursorData.hotx) || 0;
-        this._rawHotspotY = parseInt(cursorData.hoty) || 0;
-        this._cursorBase64Data = cursorData.curdata;
+        await this._applyLocalCursor();
+    }
+
+    /**
+     * Shows the last server cursor shape at the local pointer, as a CSS cursor
+     * or on the cursor canvas; hidden without a shape or while the server
+     * composites the pointer into the picture.
+     */
+    async _applyLocalCursor() {
         if (!this.inputAttached) {
             this.cursorDiv.style.display = 'none';
             this.element.style.cursor = 'auto';
             return;
         }
+        if (this._serverCursor || !this._cursorBase64Data) {
+            this.cursorDiv.style.display = 'none';
+            this.element.style.setProperty('cursor', 'none', 'important');
+            return;
+        }
         if (this.use_browser_cursors) {
             this.cursorDiv.style.display = 'none';
             this._updateBrowserCursor();
-        } else {
-            this._cursorImageBitmap = await this._cursorBitmapFromBase64(this._cursorBase64Data);
-            this.element.style.setProperty('cursor', 'none', 'important');
-            this.cursorDiv.style.display = 'block';
-            this._drawAndScaleCursor();
+            return;
         }
+        this.element.style.setProperty('cursor', 'none', 'important');
+        if (!this._cursorImageBitmap) {
+            const data = this._cursorBase64Data;
+            const bitmap = await this._cursorBitmapFromBase64(data);
+            if (data !== this._cursorBase64Data) return;
+            this._cursorImageBitmap = bitmap;
+        }
+        this.cursorDiv.style.display = 'block';
+        this._drawAndScaleCursor();
+    }
+
+    /**
+     * Decides who draws the pointer. The server composites it into the picture
+     * while the stream is pointer-locked or a touch trackpad moves it, since no
+     * local pointer sits at the remote position then; a mouse or pen always
+     * gets the local cursor, whatever the touch mode. `force` resends the
+     * state to a fresh connection.
+     * @param {boolean} [force=false]
+     */
+    syncCursorRendering(force = false) {
+        const server = this._isStreamLocked() || (this._trackpadMode && this._touchDrives);
+        const changed = server !== this._serverCursor;
+        if (!changed && !force) return;
+        this._serverCursor = server;
+        this.send(`SET_NATIVE_CURSOR_RENDERING,${server ? 1 : 0}`);
+        if (changed) this._applyLocalCursor();
+    }
+
+    /** Notes whether touch or a mouse/pen moved the pointer, switching the cursor rendering with it. */
+    _noteInputSource(touch) {
+        if (this._touchDrives === touch) return;
+        this._touchDrives = touch;
+        this.syncCursorRendering();
     }
 
     /** Marks input as synthetic (tests), which disables the keydown stuck-modifier heal. */
@@ -1762,6 +1821,7 @@ export class Input {
      * reset, while the page is hidden or detached.
      */
     resetKeyboard() {
+        if (this._trackpadTouches?.size || this._trackpadCtrlHeld || this._trackpadLastTapTime) this._resetTrackpadState();
         this._stopKeyHeartbeat();
         clearTimeout(this._altGrTimeout);
         this._altGrArmed = false;
@@ -1843,6 +1903,15 @@ export class Input {
             }
         }
         if (this._targetHasClass(event.target, WHITELIST_CLASS)) return;
+        if (event.target === this.keyboardInputAssist && (event.isComposing || this._mobileComposing || event.keyCode === 229)) return;
+        if (event.target === this.keyboardInputAssist &&
+            !event.ctrlKey && !event.metaKey && !event.altKey &&
+            (event.key === 'Enter' || event.key === 'Backspace' || (event.key && event.key.length === 1))) {
+            // Assist-field typing reaches the session through _handleMobileInput
+            // and _handleKbdAssistKeyDown; forwarding here would double-send.
+            // Modifier chords fire no input event, so they keep this path.
+            return;
+        }
         if (!this._guac_markEvent(event)) return;
         this._releaseDesyncedModifiers(event);
         const keycode = KeyboardUtil.getKeyCode(event);
@@ -2188,6 +2257,12 @@ export class Input {
         }, 0);
     }
 
+    pasteClipboard() {
+        const options = { key: 'v', code: 'KeyV', ctrlKey: true, cancelable: true };
+        this._handleKeyDown(new KeyboardEvent('keydown', options));
+        this._handleKeyUp(new KeyboardEvent('keyup', options));
+    }
+
     /**
      * Types a string as momentary presses, one keysym per codepoint so an
      * astral character is sent whole rather than as two lone surrogates the
@@ -2335,18 +2410,78 @@ export class Input {
         return false;
     }
 
-    /** Types text from the mobile keyboard assist element and clears it; a held chord was sent by the keydown path, so its echo is dropped. */
+    /**
+     * Types text from the mobile keyboard assist element and re-primes its
+     * sentinel; a held chord was sent by the keydown path, so its echo is
+     * dropped. The field is never left empty: many soft keyboards emit no key
+     * event at all for Backspace on an empty field, so the deletion of the
+     * sentinel is what a Backspace is read from.
+     */
     _handleMobileInput(event) {
-        const text = event.target.value;
-        if (!text) {
+        if (event.isComposing || this._mobileComposing) return;
+        if (this._mobileCompositionEcho && event.data === this._mobileCompositionEcho) {
+            this._mobileCompositionEcho = null;
+            event.target.value = KBD_ASSIST_SENTINEL;
             return;
         }
-        if (this._chordModifierHeld()) {
-            event.target.value = '';
+        const field = event.target;
+        let text = field.value;
+        if (event.inputType === 'deleteContentBackward' || text.length === 0) {
+            field.value = KBD_ASSIST_SENTINEL;
+            if (this._chordModifierHeld()) return;
+            this._sendMomentaryKey(KeyTable.XK_BackSpace);
             return;
         }
-        this._typeText(text);
-        event.target.value = '';
+        if (text.startsWith(KBD_ASSIST_SENTINEL)) {
+            text = text.slice(KBD_ASSIST_SENTINEL.length);
+        }
+        field.value = KBD_ASSIST_SENTINEL;
+        if (this._chordModifierHeld() || !text) return;
+        for (const char of text) {
+            if (char === '\n' || char === '\r') {
+                this._sendMomentaryKey(KeyTable.XK_Return);
+            } else {
+                this._typeText(char);
+            }
+        }
+    }
+
+    _mobileCompositionStart() {
+        clearTimeout(this._mobileCommitTimer);
+        this._mobileCompositionEcho = null;
+        this._mobileComposing = true;
+    }
+
+    _mobileCompositionEnd(event) {
+        this._mobileComposing = false;
+        if (event.data && !this._chordModifierHeld()) this._typeText(event.data);
+        event.target.value = KBD_ASSIST_SENTINEL;
+        this._mobileCompositionEcho = event.data;
+        // WebKit can deliver the committed input after compositionend in the same task.
+        this._mobileCommitTimer = setTimeout(() => { this._mobileCompositionEcho = null; }, 0);
+    }
+
+    /** Puts the sentinel back whenever the field takes focus. */
+    _primeKbdAssist(event) {
+        this._mobileComposing = false;
+        this._mobileCompositionEcho = null;
+        event.target.value = KBD_ASSIST_SENTINEL;
+    }
+
+    /**
+     * Enter and an already-empty Backspace mutate a single-line input in no
+     * way, so no `input` event fires for them and only the keydown carries them.
+     */
+    _handleKbdAssistKeyDown(event) {
+        if (event.isComposing || this._mobileComposing || event.keyCode === 229) return;
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            this._sendMomentaryKey(KeyTable.XK_Return);
+        } else if (event.key === 'Backspace' && event.target.value.length === 0) {
+            event.preventDefault();
+            this._sendMomentaryKey(KeyTable.XK_BackSpace);
+        }
     }
 
     /**
@@ -2366,7 +2501,10 @@ export class Input {
         if (this.buttonMask === 0 && event.target !== this.element) {
             return;
         }
-        if (this.inputAttached && !this.use_browser_cursors) {
+        const fromTouch = this._isTouchDerivedMouseEvent(event);
+        if (this._trackpadMode && fromTouch) return;
+        if (!fromTouch) this._noteInputSource(false);
+        if (this.inputAttached && !this.use_browser_cursors && this._cursorImageBitmap && !this._serverCursor) {
             this.cursorDiv.style.display = 'block';
             this.element.style.setProperty('cursor', 'none', 'important');
         }
@@ -2386,7 +2524,6 @@ export class Input {
         }
         this._latestMouseX = visualClientX;
         this._latestMouseY = visualClientY;
-        if (this._trackpadMode) return;
         const dpr_for_input_coords = this._inputDpr();
         const down = (event.type === 'mousedown' || event.type === 'pointerdown' ? 1 : 0);
         if (down) {
@@ -2564,181 +2701,212 @@ export class Input {
         this._mouseButtonMovement(event);
     }
 
-    /**
-     * Trackpad emulation: one finger moves the pointer relatively, a tap
-     * clicks, a tap then hold drags, two fingers scroll, and a two-finger tap
-     * right-clicks. Every payload is relative motion.
-     */
+    /** Relative touch gestures keep their pointer anchor across finger lifts. */
     _handleTrackpadEvent(event) {
         if (this._targetHasClass(event.target, WHITELIST_CLASS)) return;
         event.preventDefault();
         event.stopPropagation();
-
         const now = Date.now();
-        const TAP_AND_HOLD_THRESHOLD = 300;
+        const changed = Array.from(event.changedTouches);
+        if (event.type === 'touchcancel') {
+            this._resetTrackpadState();
+            return;
+        }
 
-        const type = event.type;
-        const changedTouches = event.changedTouches;
-
-        if (type === 'touchstart') {
-            if (this._trackpadTapTimeout) {
-                clearTimeout(this._trackpadTapTimeout);
-                this._trackpadTapTimeout = null;
-            }
-
-            for (const touch of changedTouches) {
+        if (event.type === 'touchstart') {
+            for (const touch of changed) {
                 this._trackpadTouches.set(touch.identifier, {
-                    id: touch.identifier,
-                    startX: touch.clientX, startY: touch.clientY,
-                    lastX: touch.clientX, lastY: touch.clientY,
-                    moved: false
+                    id: touch.identifier, startX: touch.clientX, startY: touch.clientY,
+                    lastX: touch.clientX, lastY: touch.clientY, moved: false, pointerMoved: false, started: now
                 });
             }
-
-            const touchCount = this._trackpadTouches.size;
-
-            if (touchCount === 1) {
-                if ((now - this._trackpadLastTapTime) < TAP_AND_HOLD_THRESHOLD) {
-                    this._trackpadGestureMode = 'dragging';
+            if (this._trackpadTouches.size === 1) {
+                this._trackpadGestureMode = this._trackpadLastTapTime > 0 && now - this._trackpadLastTapTime < TRACKPAD.doubleTapMs ? 'dragging' : 'moving';
+                this._trackpadLastTapTime = 0;
+                if (this._trackpadGestureMode === 'dragging') {
                     this.buttonMask |= 1;
                     this.send(`m2,0,0,${this.buttonMask},0`);
-                    this._trackpadLastTapTime = 0;
-                } else {
-                    this._trackpadGestureMode = 'moving';
-                }
-            }
-            else if (touchCount === 2) {
-                this._trackpadGestureMode = 'scrolling';
+                } else this._startTrackpadLongPress(TRACKPAD.longPressMs);
+            } else {
+                this._clearTrackpadLongPress();
+                this._releaseTrackpadCtrl();
                 this._trackpadLastTapTime = 0;
-                const touches = Array.from(this._trackpadTouches.values());
-                this._trackpadLastScrollCentroid = {
-                    x: (touches[0].lastX + touches[1].lastX) / 2,
-                    y: (touches[0].lastY + touches[1].lastY) / 2
+                if (this.buttonMask) { this.buttonMask = 0; this.send('m2,0,0,0,0'); }
+                this._trackpadGestureMode = this._trackpadTouches.size === 2 ? 'two-finger' : 'completed';
+                this._trackpadTwoFingerMode = null;
+                const [a, b] = this._trackpadTouches.values();
+                this._trackpadTwoFingerStart = {
+                    centroid: { x: (a.lastX + b.lastX) / 2, y: (a.lastY + b.lastY) / 2 },
+                    dist: Math.hypot(a.lastX - b.lastX, a.lastY - b.lastY)
                 };
+                this._trackpadLastScrollCentroid = this._trackpadTwoFingerStart.centroid;
+                this._trackpadScrollX = 0;
+                this._trackpadScrollY = 0;
             }
+            return;
         }
-        else if (type === 'touchmove') {
-            let hasAnyFingerMovedBeyondThreshold = false;
-            for (const touch of this._trackpadTouches.values()) {
-                if (!touch.moved) {
-                    const currentTouch = Array.from(changedTouches).find(t => t.identifier === touch.id) || touch;
-                    if (currentTouch) {
-                        const dx = currentTouch.clientX - touch.startX;
-                        const dy = currentTouch.clientY - touch.startY;
-                        if (dx * dx + dy * dy > this._TAP_THRESHOLD_DISTANCE_SQ) {
-                            touch.moved = true;
-                        }
-                    }
-                }
-                if (touch.moved) {
-                    hasAnyFingerMovedBeyondThreshold = true;
-                }
-            }
 
-            if (hasAnyFingerMovedBeyondThreshold) {
-                this._trackpadLastTapTime = 0;
-            }
-
-            if (this._trackpadGestureMode === 'moving' || this._trackpadGestureMode === 'dragging') {
-                const touchData = this._trackpadTouches.values().next().value;
-                if (touchData) {
-                    const changedTouch = Array.from(changedTouches).find(t => t.identifier === touchData.id);
-                    if (changedTouch) {
-                        const moved = this._relativeToServer(
-                            changedTouch.clientX - touchData.lastX,
-                            changedTouch.clientY - touchData.lastY);
-                        if (moved[0] !== 0 || moved[1] !== 0) {
-                            this.send(`m2,${moved[0]},${moved[1]},${this.buttonMask},0`);
-                        }
-                        touchData.lastX = changedTouch.clientX;
-                        touchData.lastY = changedTouch.clientY;
-                    }
+        if (event.type === 'touchmove') {
+            for (const touch of changed) {
+                const data = this._trackpadTouches.get(touch.identifier);
+                if (!data) continue;
+                const wasMoving = data.pointerMoved;
+                data.pointerMoved ||= Math.hypot(touch.clientX - data.startX, touch.clientY - data.startY) > TRACKPAD.moveSlop;
+                data.moved ||= Math.hypot(touch.clientX - data.startX, touch.clientY - data.startY) > TRACKPAD.tapSlop;
+                if (data.moved) this._clearTrackpadLongPress();
+                if (data === this._trackpadTouches.values().next().value &&
+                    (this._trackpadGestureMode === 'dragging' || (this._trackpadGestureMode === 'moving' && data.pointerMoved))) {
+                    const fromStart = !wasMoving && this._trackpadGestureMode === 'moving';
+                    this._sendTrackpadMove(touch.clientX - (fromStart ? data.startX : data.lastX), touch.clientY - (fromStart ? data.startY : data.lastY));
                 }
-            } else if (this._trackpadGestureMode === 'scrolling') {
-                const touches = Array.from(this._trackpadTouches.values());
-                if (touches.length === 2) {
-                    for (const changed of changedTouches) {
-                        const data = this._trackpadTouches.get(changed.identifier);
-                        if (data) { data.lastX = changed.clientX; data.lastY = changed.clientY; }
-                    }
-                    const curr_avg_x = (touches[0].lastX + touches[1].lastX) / 2;
-                    const curr_avg_y = (touches[0].lastY + touches[1].lastY) / 2;
-                    if (this._trackpadLastScrollCentroid) {
-                        const deltaX = curr_avg_x - this._trackpadLastScrollCentroid.x;
-                        const deltaY = curr_avg_y - this._trackpadLastScrollCentroid.y;
-                        const SCROLL_THRESHOLD = 2;
-                        if (Math.abs(deltaY) > SCROLL_THRESHOLD) this._triggerMouseWheel(deltaY < 0 ? 'down' : 'up', 1);
-                        if (Math.abs(deltaX) > SCROLL_THRESHOLD) this._triggerHorizontalMouseWheel(deltaX < 0 ? 'left' : 'right', 1);
-                    }
-                    this._trackpadLastScrollCentroid = { x: curr_avg_x, y: curr_avg_y };
+                data.lastX = touch.clientX;
+                data.lastY = touch.clientY;
+            }
+            if (this._trackpadGestureMode !== 'two-finger') return;
+            const [a, b] = this._trackpadTouches.values();
+            const centroid = { x: (a.lastX + b.lastX) / 2, y: (a.lastY + b.lastY) / 2 };
+            const distance = Math.hypot(a.lastX - b.lastX, a.lastY - b.lastY);
+            const start = this._trackpadTwoFingerStart;
+            if (!this._trackpadTwoFingerMode) {
+                const travel = Math.hypot(centroid.x - start.centroid.x, centroid.y - start.centroid.y);
+                const spread = Math.abs(distance - start.dist);
+                if (spread > TRACKPAD.pinchSlop && spread > travel * 1.5) {
+                    this._trackpadTwoFingerMode = 'pinch';
+                    this._trackpadPinchLastDist = start.dist;
+                    this._trackpadCtrlHeld = !this._keysymHeld(KeyTable.XK_Control_L, KeyTable.XK_Control_R);
+                    if (this._trackpadCtrlHeld) this.send('kd,' + KeyTable.XK_Control_L);
+                } else if (travel > TRACKPAD.scrollSlop && spread < travel) this._trackpadTwoFingerMode = 'scroll';
+            }
+            if (this._trackpadTwoFingerMode === 'scroll') {
+                this._scrollTrackpad(centroid.x - this._trackpadLastScrollCentroid.x, centroid.y - this._trackpadLastScrollCentroid.y);
+                this._trackpadLastScrollCentroid = centroid;
+            } else if (this._trackpadTwoFingerMode === 'pinch') {
+                const steps = Math.trunc((distance - this._trackpadPinchLastDist) / TRACKPAD.pinchStep);
+                if (steps) {
+                    this._triggerMouseWheel(steps > 0 ? 'up' : 'down', Math.abs(steps));
+                    this._trackpadPinchLastDist += steps * TRACKPAD.pinchStep;
                 }
             }
+            return;
         }
-        else if (type === 'touchend' || type === 'touchcancel') {
-            const touchCountBeforeEnd = this._trackpadTouches.size;
-            const wasTap = !Array.from(this._trackpadTouches.values()).some(t => t.moved);
 
-            if (touchCountBeforeEnd === 2 && wasTap) {
-                this.buttonMask |= (1 << 2); this.send(`m2,0,0,${this.buttonMask},0`);
-                setTimeout(() => { this.buttonMask &= ~(1 << 2); this.send(`m2,0,0,${this.buttonMask},0`); }, 50);
-                this._trackpadGestureMode = 'completed';
-                this._trackpadLastTapTime = 0;
+        if (event.type === 'touchend') {
+            const touches = Array.from(this._trackpadTouches.values());
+            for (const touch of changed) {
+                const data = this._trackpadTouches.get(touch.identifier);
+                if (data && Math.hypot(touch.clientX - data.startX, touch.clientY - data.startY) > TRACKPAD.tapSlop) data.moved = true;
             }
-            else if (touchCountBeforeEnd === 1 && wasTap && this._trackpadGestureMode !== 'completed' && this._trackpadGestureMode !== 'dragging') {
+            const tap = touches.length && touches.every(touch => !touch.moved && now - touch.started < TRACKPAD.tapMs);
+            if (this._trackpadGestureMode === 'moving' && tap) {
+                this._clickTrackpad(1);
                 this._trackpadLastTapTime = now;
-                this._trackpadTapTimeout = setTimeout(() => {
-                    this.buttonMask |= 1; this.send(`m2,0,0,${this.buttonMask},0`);
-                    setTimeout(() => { this.buttonMask &= ~1; this.send(`m2,0,0,${this.buttonMask},0`); }, 50);
-                }, 200);
-            }
-
-            for (const touch of changedTouches) {
-                this._trackpadTouches.delete(touch.identifier);
-            }
-
-            if (this._trackpadTouches.size === 0) {
-                if (this._trackpadGestureMode === 'dragging') {
-                    this.buttonMask &= ~1;
-                    this.send(`m2,0,0,${this.buttonMask},0`);
-                }
-                this._trackpadGestureMode = null;
-                this._trackpadLastScrollCentroid = null;
-            }
+            } else if (this._trackpadGestureMode === 'two-finger' && !this._trackpadTwoFingerMode && tap) this._clickTrackpad(4);
+            if (this.buttonMask) { this.buttonMask = 0; this.send('m2,0,0,0,0'); }
+            for (const touch of changed) this._trackpadTouches.delete(touch.identifier);
+            this._clearTrackpadLongPress();
+            this._releaseTrackpadCtrl();
+            this._trackpadGestureMode = this._trackpadTouches.size ? 'completed' : null;
+            this._trackpadTwoFingerMode = null;
         }
     }
 
+    _clickTrackpad(mask) {
+        this.send(`m2,0,0,${this.buttonMask | mask},0`);
+        this.send(`m2,0,0,${this.buttonMask},0`);
+    }
+
+    /** Accumulate distance independently on both axes, preserving sub-notch travel. */
+    _scrollTrackpad(dx, dy) {
+        for (const [axis, delta] of [['X', dx], ['Y', dy]]) {
+            const key = `_trackpadScroll${axis}`;
+            const previous = this[key] || 0;
+            this[key] = (previous * delta < 0 ? 0 : previous) + delta;
+            const steps = Math.trunc(this[key] / TRACKPAD.scrollStep);
+            if (!steps) continue;
+            this[key] -= steps * TRACKPAD.scrollStep;
+            if (axis === 'Y') this._triggerMouseWheel(steps > 0 ? 'up' : 'down', Math.abs(steps));
+            else this._triggerHorizontalMouseWheel(steps > 0 ? 'right' : 'left', Math.abs(steps));
+        }
+    }
+
+    _startTrackpadLongPress(duration) {
+        this._clearTrackpadLongPress();
+        this._trackpadLongPressTimer = setTimeout(() => {
+            this._trackpadLongPressTimer = null;
+            const touch = this._trackpadTouches.values().next().value;
+            if (this._trackpadTouches.size === 1 && touch && !touch.moved && this._trackpadGestureMode === 'moving') {
+                this._trackpadGestureMode = 'completed';
+                this._clickTrackpad(4);
+            }
+        }, duration);
+    }
+
+    _clearTrackpadLongPress() {
+        clearTimeout(this._trackpadLongPressTimer);
+        this._trackpadLongPressTimer = null;
+    }
+
+    _releaseTrackpadCtrl() {
+        if (this._trackpadCtrlHeld) {
+            this._trackpadCtrlHeld = false;
+            this.send('ku,' + KeyTable.XK_Control_L);
+        }
+    }
+
+    _resetTrackpadState() {
+        this._trackpadTouches.clear();
+        this._trackpadGestureMode = null;
+        this._trackpadTwoFingerMode = null;
+        this._trackpadTwoFingerStart = null;
+        this._trackpadLastScrollCentroid = null;
+        this._trackpadLastTapTime = 0;
+        this._trackpadScrollX = 0;
+        this._trackpadScrollY = 0;
+        this._relCarryX = 0;
+        this._relCarryY = 0;
+        this._clearTrackpadLongPress();
+        this._releaseTrackpadCtrl();
+        if (this.buttonMask) { this.buttonMask = 0; this.send('m2,0,0,0,0'); }
+    }
+
+    /** Fixed gain keeps precision independent of touch-event frequency and timing jitter. */
+    _sendTrackpadMove(rawDX, rawDY) {
+        const moved = this._relativeToServer(rawDX * TRACKPAD.gain, rawDY * TRACKPAD.gain);
+        if (moved[0] || moved[1]) this.send(`m2,${moved[0]},${moved[1]},${this.buttonMask},0`);
+    }
+
     /**
-     * The box a fixed-size sink presents the stream in, in CSS pixels, or
-     * null when no sink applies (auto resolution) or the box cannot be
-     * measured, so callers run their device-scaled window math instead. The
-     * sink is the ws-core canvas (manual resolution or shared mode) or the
-     * wr-core `<video>` (manual resolution; each core has its own flag).
-     *
-     * `window.streamResolutionDiverged` means the server realized a different
-     * resolution than the window-derived request (mode snapping, a rejected
-     * mode set), so the window-math contract (CSS times dpr equals server
-     * pixels) is broken and coordinates map through the stream box like
-     * manual mode: the canvas buffer on the WebSocket core, the `<video>`
-     * intrinsic size on the WebRTC core.
-     *
-     * ws-core hides `#videoCanvas` while frames are presented on the video or
-     * worker sink, which mirrors the canvas box, so a zero-size box means
-     * hidden, not resized: the visible mirror (`videoStream`,
-     * `videoWorkerCanvas`) is measured instead, else the last valid rect. The
-     * mirror lookups are cached since this runs per pointer event; a node
-     * that left the DOM (`deactivateVideoWorker`) is re-queried. A `<video>`
-     * reports its realized stream size in `videoWidth`/`videoHeight` (the
-     * attributes may be unset) and `object-fit: contain` letterboxes the
-     * frame inside the element box, so the mapping uses the fitted content
-     * box; a canvas reports its buffer.
+     * Trackpad mode only reinterprets touch input; real mouse and pen input
+     * stays absolute so a hybrid device (touchscreen plus mouse) remains
+     * usable. Only the browser's touch-synthesized compatibility mouse events
+     * are swallowed, since they would teleport the relative cursor to the last
+     * tap position.
+     */
+    _isTouchDerivedMouseEvent(event) {
+        if (event.pointerType === 'touch') return true;
+        if (event.sourceCapabilities && event.sourceCapabilities.firesTouchEvents) return true;
+        return (performance.now() - this._lastTouchActivityTime) < 1000;
+    }
+
+    /**
+     * Decoded geometry is authoritative when bandwidth adaptation changes the requested size.
      * @param {HTMLCanvasElement|null} canvas
      * @param {HTMLVideoElement|null} videoEle
      * @returns {{boxLeft: number, boxTop: number, boxW: number, boxH: number, sinkW: number, sinkH: number}|null}
      */
     _sinkBox(canvas, videoEle) {
-        const sink = ((window.manual_resolution || this.isSharedMode || window.streamResolutionDiverged) && canvas)
+        let sink = ((window.manual_resolution || this.isSharedMode || window.streamResolutionDiverged) && canvas)
             ? canvas
-            : ((window.manualResolution || window.streamResolutionDiverged) && videoEle) ? videoEle : null;
+            : videoEle || null;
+        if (!sink && canvas) {
+            this._sinkMirrors ||= {};
+            let mirror = this._sinkMirrors.videoStream;
+            if (!mirror || !mirror.isConnected) {
+                mirror = document.getElementById('videoStream');
+                this._sinkMirrors.videoStream = mirror;
+            }
+            if (mirror && mirror.videoWidth > 0) sink = mirror;
+        }
         if (!sink) {
             return null;
         }
@@ -2757,6 +2925,7 @@ export class Input {
                 const mirrorRect = mirror.getBoundingClientRect();
                 if (mirrorRect.width > 0 && mirrorRect.height > 0) {
                     rect = mirrorRect;
+                    sink = mirror;
                     break;
                 }
             }
@@ -2769,7 +2938,7 @@ export class Input {
         if (rect.width > 0 && rect.height > 0 && sinkW > 0 && sinkH > 0) {
             this._lastSinkRect = rect;
             let boxLeft = rect.left, boxTop = rect.top, boxW = rect.width, boxH = rect.height;
-            if (sink.tagName === 'VIDEO' && (sink.style.objectFit || 'contain') !== 'fill') {
+            if ((sink.style.objectFit || (sink.tagName === 'VIDEO' ? 'contain' : 'fill')) === 'contain') {
                 const fit = Math.min(rect.width / sinkW, rect.height / sinkH);
                 boxW = sinkW * fit;
                 boxH = sinkH * fit;
@@ -2907,8 +3076,10 @@ export class Input {
 
     /**
      * Maps a client position through the sink box into `this.x`/`this.y`.
-     * A position past the box during a cross-display drag maps into the
-     * neighboring display's region; otherwise it clamps to this display.
+     * A position past the box during a cross-display drag (a button held)
+     * maps into the neighboring display's region; otherwise it clamps to this
+     * display, so a hover or tap on a letterbox bar inside the sink element
+     * (`object-fit: contain`, fitStreamBox) stays on this display's edge.
      * @param {number} [screenX] Desktop position of the same point, which
      *     places a crossing on the neighbor's box exactly.
      * @param {number} [screenY]
@@ -2923,7 +3094,7 @@ export class Input {
         const scaleY = box.sinkH / box.boxH;
         const rx = (clientX - box.boxLeft) * scaleX;
         const ry = (clientY - box.boxTop) * scaleY;
-        if (this._mapToLayout(rx, ry, scaleX, scaleY, screenX, screenY)) {
+        if (this.buttonMask && this._mapToLayout(rx, ry, scaleX, scaleY, screenX, screenY)) {
             return true;
         }
         this.x = Math.max(0, Math.min(box.sinkW, Math.round(rx)));
@@ -3159,8 +3330,8 @@ export class Input {
      * Quantize a relative motion to whole server pixels, carrying the remainder.
      *
      * Rounding each event on its own discards a fraction of a pixel every time,
-     * and a stream of sub-pixel deltas — what any client whose scale is not a
-     * whole number produces — turns that into a systematic sensitivity error
+     * and a stream of sub-pixel deltas - what any client whose scale is not a
+     * whole number produces - turns that into a systematic sensitivity error
      * whose size depends on how fast the pointer is moving, and into drift on
      * motion that should cancel out. A carry that ever went non-finite would
      * stay that way and put `NaN` on the wire, so it restarts from zero.
@@ -3236,6 +3407,7 @@ export class Input {
         }
 
         console.log(`Input: Trackpad mode ${newMode ? 'enabled' : 'disabled'}.`);
+        this._resetTrackpadState();
         this._trackpadMode = newMode;
 
         this._activeTouches.clear();
@@ -3254,13 +3426,7 @@ export class Input {
             this._sendMouseState();
         }
 
-        if (this._trackpadMode || this.use_browser_cursors) {
-            this.element.style.setProperty('cursor', 'none', 'important');
-            this.element.style.cursor = 'default';
-        } else {
-            this.element.style.setProperty('cursor', 'none', 'important');
-            this.cursorDiv.style.display = 'none';
-        }
+        this.syncCursorRendering();
     }
 
     /** Switches between the CSS cursor and the page-drawn cursor canvas. */
@@ -3271,24 +3437,7 @@ export class Input {
         }
         console.log(`Input: Use browser cursors ${newMode ? 'enabled' : 'disabled'}.`);
         this.use_browser_cursors = newMode;
-        if (this._trackpadMode) {
-            this.cursorDiv.style.display = 'none';
-            this.element.style.setProperty('cursor', 'none', 'important');
-        } else if (this.use_browser_cursors) {
-            this.cursorDiv.style.display = 'none';
-            this._updateBrowserCursor();
-        } else {
-            this.element.style.setProperty('cursor', 'none', 'important');
-            if (this._cursorBase64Data && !this._cursorImageBitmap) {
-                this._cursorImageBitmap = await this._cursorBitmapFromBase64(this._cursorBase64Data);
-            }
-            if (this._cursorImageBitmap) {
-                this.cursorDiv.style.display = 'block';
-                this._drawAndScaleCursor();
-            } else {
-                this.cursorDiv.style.display = 'none';
-            }
-        }
+        await this._applyLocalCursor();
     }
 
     /**
@@ -3297,6 +3446,8 @@ export class Input {
      * scroll, and a third finger releases everything.
      */
     _handleTouchEvent(event) {
+        this._lastTouchActivityTime = performance.now();
+        this._noteInputSource(true);
         if (this._trackpadMode) {
             this._handleTrackpadEvent(event);
             return;
@@ -3463,10 +3614,11 @@ export class Input {
                 const deltaDistSq = deltaX * deltaX + deltaY * deltaY;
                 if (this._isTwoFingerGesture) {
                     // Two-finger scrolling is handled above.
-                } else if (!swipeDetected && this._activeTouchIdentifier === null && this._activeTouches.size === 1 && this._activeTouches.has(identifier)) {
+                } else if (!swipeDetected && type === 'touchend' && this._activeTouchIdentifier === null && this._activeTouches.size === 1 && this._activeTouches.has(identifier)) {
                     if (duration < this._TAP_MAX_DURATION && deltaDistSq < TAP_THRESHOLD_DISTANCE_SQ_LOGICAL) {
                         this._calculateTouchCoordinates(endedTouch); this.buttonMask |= 1; this._sendMouseState(); preventDefault = true;
-                        setTimeout(() => { this.buttonMask &= ~1; this._sendMouseState(); }, 10);
+                        clearTimeout(this._tapReleaseTimer);
+                        this._tapReleaseTimer = setTimeout(() => { this._tapReleaseTimer = null; this.buttonMask &= ~1; this._sendMouseState(); }, 10);
                     }
                 } else if (!swipeDetected && identifier === this._activeTouchIdentifier) {
                     this._calculateTouchCoordinates(endedTouch); this.buttonMask &= ~1; this._sendMouseState();
@@ -3645,7 +3797,8 @@ export class Input {
             if (this._allowTrackpadScrolling) {
                 this._allowTrackpadScrolling = false;
                 this._mouseWheel(event);
-                setTimeout(() => {
+                this._wheelFlushTimer = setTimeout(() => {
+                    this._wheelFlushTimer = null;
                     this._allowTrackpadScrolling = true;
                     this._emitWheelY();
                     this._emitWheelX();
@@ -3770,7 +3923,7 @@ export class Input {
     /**
      * The elements a stream pointer lock can be held on: the input overlay, and
      * the sinks a Ctrl-Shift-Click lands on where the overlay does not cover
-     * them — either core's video element and the ws-core canvases.
+     * them - either core's video element and the ws-core canvases.
      * @returns {Element[]}
      */
     _streamLockTargets() {
@@ -3792,19 +3945,19 @@ export class Input {
     }
 
     /**
-     * Pointer lock change: reports it to the server (`p`,
-     * `SET_NATIVE_CURSOR_RENDERING`), resets the relative carry, and on unlock
-     * releases the keyboard and shows the page-drawn cursor.
+     * Pointer lock change: reports it to the server (`p`, then the cursor
+     * rendering), resets the relative carry, and on unlock releases the
+     * keyboard and shows the page-drawn cursor.
      */
     _pointerLock() {
         this._relCarryX = 0;
         this._relCarryY = 0;
         if (this._isStreamLocked()) {
             this.send("p,1");
-            this.send("SET_NATIVE_CURSOR_RENDERING,1");
+            this.syncCursorRendering();
         } else {
             this.send("p,0");
-            this.send("SET_NATIVE_CURSOR_RENDERING,0");
+            this.syncCursorRendering();
             this.resetKeyboard();
             this.cursorDiv.style.visibility = 'visible'
         }
@@ -3935,19 +4088,21 @@ export class Input {
      */
     _isStreamFullscreen() {
         const fsElement = document.fullscreenElement;
-        return fsElement !== null && fsElement.contains(this.element);
+        // Engines without unprefixed fullscreen report undefined, not null.
+        if (!fsElement) return false;
+        return fsElement.contains(this.element);
     }
 
     /**
      * Take pointer lock on an element, asking for raw movement deltas.
      *
-     * Locked motion is relayed as relative motion and injected verbatim — both
-     * XTEST and the Wayland backend pass deltas through unaccelerated — so the
+     * Locked motion is relayed as relative motion and injected verbatim - both
+     * XTEST and the Wayland backend pass deltas through unaccelerated - so the
      * OS curve the engine applies to movementX/Y is what separates how far a
      * hand moved from how far the remote pointer went, and it grows with speed.
      * unadjustedMovement asks for the deltas before that curve, which is what
      * games and 3D applications expect from pointer lock. Platforms that cannot
-     * deliver them — Linux and Android, on every engine — reject the option
+     * deliver them - Linux and Android, on every engine - reject the option
      * with NotSupportedError, and the first refusal turns it off for the page;
      * `again` re-runs the request the way its caller would, so guarded callers
      * re-check their guards. Engines older than the promise-returning API
@@ -4109,6 +4264,10 @@ export class Input {
         // A frozen background tab stops the heartbeat, so keys are released first.
         this.listeners_context.push(addListener(document, 'freeze', this.resetKeyboard, this));
         this.listeners_context.push(addListener(this.keyboardInputAssist, 'input', this._handleMobileInput, this));
+        this.listeners_context.push(addListener(this.keyboardInputAssist, 'focus', this._primeKbdAssist, this));
+        this.listeners_context.push(addListener(this.keyboardInputAssist, 'compositionstart', this._mobileCompositionStart, this));
+        this.listeners_context.push(addListener(this.keyboardInputAssist, 'compositionend', this._mobileCompositionEnd, this));
+        this.listeners_context.push(addListener(this.keyboardInputAssist, 'keydown', this._handleKbdAssistKeyDown, this));
         this.listeners_context.push(addListener(document, 'mousedown', this._handleOutsideClick, this, true));
         this.listeners_context.push(addListener(document, 'touchstart', this._handleOutsideClick, this, true));
 
@@ -4185,6 +4344,16 @@ export class Input {
 
     /** Removes the input context listeners, releases every key and button, and exits pointer lock. */
     detach_context() {
+        clearTimeout(this._mobileCommitTimer);
+        // The pending tap release and wheel flush would send into a torn-down channel.
+        clearTimeout(this._tapReleaseTimer);
+        this._tapReleaseTimer = null;
+        clearTimeout(this._wheelFlushTimer);
+        this._wheelFlushTimer = null;
+        this._allowTrackpadScrolling = true;
+        this._resetWheelLearning();
+        this._mobileComposing = false;
+        this._mobileCompositionEcho = null;
         this._stopKeyHeartbeat();
         removeListeners(this.listeners_context);
         this.listeners_context = [];
@@ -4199,8 +4368,9 @@ export class Input {
         this._pendingMove = null;
         this._relCarryX = 0;
         this._relCarryY = 0;
-        if ((this.buttonMask & 1) === 1) {
-             this.buttonMask &= ~1;
+        this._resetTrackpadState();
+        if (this.buttonMask !== 0) {
+             this.buttonMask = 0;
              this._sendMouseState();
         }
         this.inputAttached = false;

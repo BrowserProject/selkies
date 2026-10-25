@@ -1,4 +1,4 @@
-/*
+/*!
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -8,7 +8,7 @@
  * When a striped codec's frame can be taken as whole.
  *
  * The striped paths composite partial-height stripes, so a frame is only
- * known complete once the next frame id arrives — a capture period later.
+ * known complete once the next frame id arrives - a capture period later.
  * Presenting on socket quiet instead puts the frame on screen in the tick its
  * stripes landed. A frame's stripes arrive in waves (the encoder's thread
  * pool, then the event loop), so quiet shorter than the widest gap seen

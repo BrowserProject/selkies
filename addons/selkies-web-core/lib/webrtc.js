@@ -1,4 +1,4 @@
-/* This Source Code Form is subject to the terms of the Mozilla Public
+/*! This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
@@ -50,7 +50,31 @@
  * @module
  */
 
-import { Input } from "./input";
+import { Input } from "./input.js";
+import { freezeVideoFrame, clearFrozenFrameOnNextFrame } from "./freeze-frame.js";
+
+// mirrored from containers/base/stream_hold.py (PATH_PROTOCOLS). Keep in sync.
+const PATH_PROTOCOLS = ["udp", "tcp", "tls"];
+
+/**
+ * Selected candidate pair of a `getStats()` report: the first transport's
+ * `selectedCandidatePairId`, or without transport stats (Firefox) the pair
+ * flagged `selected`. Undefined while none is selected.
+ * @param {RTCStatsReport} stats
+ * @returns {Object|undefined}
+ */
+function selectedCandidatePair(stats) {
+	let transport;
+	let flagged;
+	stats.forEach((report) => {
+		if (report.type === "transport") {
+			if (transport === undefined) transport = report;
+		} else if (report.type === "candidate-pair" && report.selected === true) {
+			flagged = report;
+		}
+	});
+	return transport !== undefined ? stats.get(transport.selectedCandidatePairId) : flagged;
+}
 
 /**
  * WebRTC client: one peer connection plus its data channel.
@@ -60,9 +84,9 @@ import { Input } from "./input";
  * `ondatachannelopen` and `ondatachannelclose` nothing, `onplaystreamrequired`
  * fires when autoplay was refused and a user gesture is needed, and
  * `onclipboardcontent`, `oncursorchange`, `onsystemaction`, `ongpustats`,
- * `onsystemstats`, `onlatencymeasurement`, `onserversettings` and
- * `ondisplayconfig` receive the payload of the data channel message of the
- * same kind.
+ * `onsystemstats`, `onlatencymeasurement`, `onserversettings`,
+ * `ondisplayconfig` and `ondesktopcontrol` receive the payload of the data
+ * channel message of the same kind.
  */
 export class WebRTCClient {
 	/**
@@ -83,18 +107,16 @@ export class WebRTCClient {
 		/** Accept only relay ICE candidates and force `iceTransportPolicy` to `relay`. @type {boolean} */
 		this.forceTurn = false;
 
-		/** Configuration handed to `RTCPeerConnection`. @type {Object} */
+		/**
+		 * Configuration handed to `RTCPeerConnection`; replaced before connect
+		 * with the ICE servers our API issues. No default public STUN or relay:
+		 * the deployment is relay-only through the session's own node, and a
+		 * third-party server would both leak candidates and never be reachable.
+		 * @type {Object}
+		 */
 		this.rtcPeerConfig = {
-			"lifetimeDuration": "86400s",
-			"iceServers": [
-				{
-					"urls": [
-							"stun:stun.l.google.com:19302"
-					]
-				},
-			],
-			"blockStatus": "NOT_BLOCKED",
-			"iceTransportPolicy": "all"
+			"iceServers": [],
+			"iceTransportPolicy": "relay"
 		};
 
 		/** @type {RTCPeerConnection} */
@@ -176,6 +198,9 @@ export class WebRTCClient {
 
 		/** @type {?function(Object): void} */
 		this.ondisplayconfig = null;
+
+		/** @type {?function(Object): void} */
+		this.ondesktopcontrol = null;
 	}
 
 	/** Forwards a status message to `onstatus`. */
@@ -358,13 +383,20 @@ export class WebRTCClient {
 				throw new Error('Microphone is disabled on this server.');
 			}
 			if (this._micStream) return true;
-			if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
+			if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+				throw new DOMException('getUserMedia is unavailable', 'NotSupportedError');
+			}
 			const audio = { channelCount: 1, sampleRate: 24000, echoCancellation: true, noiseSuppression: true, autoGainControl: true };
 			if (deviceId) audio.deviceId = { exact: deviceId };
 			this._micStream = await navigator.mediaDevices.getUserMedia({
 				audio,
 				video: false
 			});
+			if (this._disposed) {
+				this._micStream.getTracks().forEach(track => track.stop());
+				this._micStream = null;
+				return false;
+			}
 			const track = this._micStream.getAudioTracks()[0];
 			if (this._micTransceiver && this._micTransceiver.sender && track) {
 				await this._micTransceiver.sender.replaceTrack(track);
@@ -406,6 +438,11 @@ export class WebRTCClient {
 			const video = { width: { ideal: width }, height: { ideal: height }, frameRate: { ideal: fps } };
 			if (deviceId) video.deviceId = { exact: deviceId };
 			this._webcamStream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+			if (this._disposed) {
+				this._webcamStream.getTracks().forEach(track => track.stop());
+				this._webcamStream = null;
+				return false;
+			}
 			const track = this._webcamStream.getVideoTracks()[0];
 			if (this._webcamTransceiver && this._webcamTransceiver.sender && track) {
 				await this._setSenderActive(this._webcamTransceiver.sender, true);
@@ -644,15 +681,26 @@ export class WebRTCClient {
 			if (this.ondisplayconfig !== null) {
 				this.ondisplayconfig(msg.data);
 			}
+		} else if (msg.type === 'desktop_control') {
+			if (this.ondesktopcontrol !== null) {
+				this.ondesktopcontrol(msg.data);
+			}
 		} else {
 			this._setError("Unhandled message received: " + msg.type);
 		}
 	}
 
 	/**
-	 * Reacts to the peer connection state: `connected` marks the client up,
-	 * `disconnected` closes the data channel and unloads the element, `failed`
-	 * unloads it.
+	 * Reacts to the peer connection state.
+	 *
+	 * Neither branch resets the `<video>` any more. `element.load()` drops the
+	 * decoded picture within a frame (readyState 0, a 2x2 black placeholder),
+	 * and both states are recoverable from the page's point of view:
+	 * `disconnected` is what a paused or briefly unroutable container looks
+	 * like and an ICE restart replaces the picture by itself, and `failed`
+	 * still has ~90 s of transport retry ahead of it. So the last frame stays:
+	 * on `failed` it is copied out first (a canvas that outlives this element),
+	 * and whatever comes up next clears it on its first painted frame.
 	 * @param {string} state
 	 */
 	_handleConnectionStateChange(state) {
@@ -660,28 +708,35 @@ export class WebRTCClient {
 			case "connected":
 				this._setStatus("Connection complete");
 				this._connected = true;
+				// This element is presenting again; a frozen copy from the last
+				// outage would otherwise cover the live stream for good (the
+				// core's own "first frame" latch does not fire twice). It goes
+				// on the first PAINTED frame, so there is no black gap between.
+				clearFrozenFrameOnNextFrame(this.element);
 				break;
 
 			case "disconnected":
 				this._setError("Peer connection disconnected");
-				if (this._send_channel !== null && this._send_channel.readyState === 'open') {
-						this._send_channel.close();
-				}
-				this.element.load();
+				// ICE can recover without renegotiating the data channel.
+				// Recoverable: keep the picture. An ICE restart repaints it.
 				break;
 
 			case "failed":
 				this._setError("Peer connection failed");
-				this.element.load();
+				// The element is about to stop presenting; the copy outlives it
+				// and is cleared by the next stream's first frame. The media is
+				// left alone: the transport still has one ICE restart to spend
+				// on this very element.
+				freezeVideoFrame(this.element, { stopMedia: false });
 				break;
 			default:
 		}
 	}
 
 	/**
-	 * Outbound queue depth of the data channel; bulk senders (clipboard,
-	 * uploads) throttle on this so they cannot starve input and stats on the
-	 * same channel.
+	 * Outbound queue depth of the data channel; bulk senders (the clipboard)
+	 * throttle on this so they cannot starve input and stats on the same
+	 * channel.
 	 * @returns {number}
 	 */
 	dataChannelBufferedAmount() {
@@ -777,7 +832,8 @@ export class WebRTCClient {
 	 * linked codec report; `video.decoder` reads `unknown` outside a capturing
 	 * media context, the only state that exposes `decoderImplementation`), and
 	 * `data` from the data-channel report; the raw
-	 * reports are attached as `reports` and `allReports`. The audio section's
+	 * reports are attached as `reports` and `allReports`. Null while there is no
+	 * peer connection (between a reset and its replacement). The audio section's
 	 * NetEQ concealment counters are the RED acceptance metric; Chrome reports
 	 * opus+red under the codec name `opus`, so RED presence is confirmed from
 	 * the SDP or the packet size, never from `codecName`.
@@ -785,6 +841,11 @@ export class WebRTCClient {
 	 */
 	getConnectionStats() {
 		var pc = this.peerConnection;
+		// The stats poller keeps ticking across a reset(), which closes the old
+		// peer connection before the new one exists. A tick in that gap has
+		// nothing to read: null, so the caller can skip it quietly instead of
+		// logging a TypeError three times per reconnect.
+		if (!pc || typeof pc.getStats !== 'function') return Promise.resolve(null);
 		var connectionDetails = {
 			general: {
 				bytesReceived: 0,
@@ -800,6 +861,7 @@ export class WebRTCClient {
 				frameHeight: 0,
 				frameWidth: 0,
 				framesPerSecond: 0,
+				framesDecoded: null,
 				packetsReceived: 0,
 				packetsLost: 0,
 				codecName: "NA",
@@ -851,9 +913,6 @@ export class WebRTCClient {
 						reports.transports[report.id] = report;
 					} else if (report.type === "candidate-pair") {
 						reports.candidatePairs[report.id] = report;
-						if (report.selected === true) {
-							reports.selectedCandidatePairId = report.id;
-						}
 					} else if (report.type === "inbound-rtp") {
 						if (report.kind === "video") {
 							reports.videoRTP = report;
@@ -882,6 +941,7 @@ export class WebRTCClient {
 					connectionDetails.video.frameHeight = videoRTP.frameHeight;
 					connectionDetails.video.frameWidth = videoRTP.frameWidth;
 					connectionDetails.video.framesPerSecond = videoRTP.framesPerSecond;
+					if (typeof videoRTP.framesDecoded === "number") connectionDetails.video.framesDecoded = videoRTP.framesDecoded;
 					connectionDetails.video.packetsReceived = videoRTP.packetsReceived;
 					connectionDetails.video.packetsLost = videoRTP.packetsLost;
 
@@ -915,29 +975,27 @@ export class WebRTCClient {
 					connectionDetails.data.messagesSent =  dataChannel.messagesSent;
 				}
 
+				var candidatePair = selectedCandidatePair(stats);
+				reports.selectedCandidatePairId = candidatePair !== undefined ? candidatePair.id : null;
 				if (Object.keys(reports.transports).length > 0) {
 					var transport = reports.transports[Object.keys(reports.transports)[0]];
 					connectionDetails.general.bytesReceived = transport.bytesReceived;
 					connectionDetails.general.bytesSent = transport.bytesSent;
-					reports.selectedCandidatePairId = transport.selectedCandidatePairId;
-				} else if (reports.selectedCandidatePairId !== null) {
-					connectionDetails.general.bytesReceived = reports.candidatePairs[reports.selectedCandidatePairId].bytesReceived;
-					connectionDetails.general.bytesSent = reports.candidatePairs[reports.selectedCandidatePairId].bytesSent;
+				} else if (candidatePair !== undefined) {
+					connectionDetails.general.bytesReceived = candidatePair.bytesReceived;
+					connectionDetails.general.bytesSent = candidatePair.bytesSent;
 				}
 
-				if (reports.selectedCandidatePairId !== null) {
-					var candidatePair = reports.candidatePairs[reports.selectedCandidatePairId];
-					if (candidatePair !== undefined) {
-						if (candidatePair.availableIncomingBitrate !== undefined) {
-							connectionDetails.general.availableReceiveBandwidth = candidatePair.availableIncomingBitrate;
-						}
-						if (candidatePair.currentRoundTripTime !== undefined) {
-							connectionDetails.general.currentRoundTripTime = candidatePair.currentRoundTripTime;
-						}
-						var remoteCandidate = reports.remoteCandidates[candidatePair.remoteCandidateId];
-						if (remoteCandidate !== undefined) {
-							connectionDetails.general.connectionType = remoteCandidate.candidateType;
-						}
+				if (candidatePair !== undefined) {
+					if (candidatePair.availableIncomingBitrate !== undefined) {
+						connectionDetails.general.availableReceiveBandwidth = candidatePair.availableIncomingBitrate;
+					}
+					if (candidatePair.currentRoundTripTime !== undefined) {
+						connectionDetails.general.currentRoundTripTime = candidatePair.currentRoundTripTime;
+					}
+					var remoteCandidate = reports.remoteCandidates[candidatePair.remoteCandidateId];
+					if (remoteCandidate !== undefined) {
+						connectionDetails.general.connectionType = remoteCandidate.candidateType;
 					}
 				}
 
@@ -960,6 +1018,39 @@ export class WebRTCClient {
 				resolve(connectionDetails);
 			}).catch( (e) => reject(e));
 		});
+	}
+
+	/**
+	 * Protocol of this side's leg of the selected candidate pair: a relay
+	 * candidate's leg to the TURN server (`relayProtocol`), otherwise the
+	 * candidate's own `protocol`. Null while nothing is selected, and for
+	 * anything but `udp`, `tcp` or `tls`.
+	 * @returns {Promise<?string>}
+	 */
+	async pathProtocol() {
+		const pc = this.peerConnection;
+		if (!pc || typeof pc.getStats !== 'function') return null;
+		const stats = await pc.getStats();
+		const pair = selectedCandidatePair(stats);
+		const local = pair && stats.get(pair.localCandidateId);
+		if (!local) return null;
+		const protocol = local.candidateType === "relay" ? local.relayProtocol : local.protocol;
+		return PATH_PROTOCOLS.includes(protocol) ? protocol : null;
+	}
+
+	/**
+	 * The ICE transport under this peer connection (the data channel's, else a
+	 * receiver's), null where the browser exposes none.
+	 * @returns {?RTCIceTransport}
+	 */
+	iceTransport() {
+		const pc = this.peerConnection;
+		if (!pc) return null;
+		const sctp = pc.sctp && pc.sctp.transport;
+		if (sctp && sctp.iceTransport) return sctp.iceTransport;
+		const receivers = typeof pc.getReceivers === "function" ? pc.getReceivers() : [];
+		const receiver = receivers.find((r) => r.transport && r.transport.iceTransport);
+		return receiver ? receiver.transport.iceTransport : null;
 	}
 
 	/**
@@ -988,7 +1079,14 @@ export class WebRTCClient {
 	 * connects the signaling client, which starts the offer/answer exchange.
 	 */
 	connect() {
-		this.peerConnection = new RTCPeerConnection(this.rtcPeerConfig);
+		if (this._disposed) return;
+		// The policy goes into the constructor: a later setConfiguration() is
+		// refused by some browsers as an unsupported modification.
+		const config = this.forceTurn
+			? Object.assign({}, this.rtcPeerConfig, { iceTransportPolicy: "relay" })
+			: this.rtcPeerConfig;
+		if (this.forceTurn) this._setStatus("forcing use of TURN server");
+		this.peerConnection = new RTCPeerConnection(config);
 		this.peerConnection.ontrack = this._ontrack.bind(this);
 		this.peerConnection.onicecandidate = this._onPeerICE.bind(this);
 		this.peerConnection.ondatachannel = this._onPeerdDataChannel.bind(this);
@@ -997,13 +1095,6 @@ export class WebRTCClient {
 			this._handleConnectionStateChange(this.peerConnection.connectionState);
 			this._setConnectionState(this.peerConnection.connectionState);
 		};
-
-		if (this.forceTurn) {
-			this._setStatus("forcing use of TURN server");
-			const config = this.peerConnection.getConfiguration();
-			config.iceTransportPolicy = "relay";
-			this.peerConnection.setConfiguration(config);
-		}
 
 		this.signaling.peer_id = this.peer_id;
 		this.signaling.connect();
@@ -1014,17 +1105,54 @@ export class WebRTCClient {
 	 * and the peer connection, and reconnects, after a three-second pause when
 	 * signaling was not stable.
 	 */
-	reset() {
-		this.cursor_cache = new Map();
-
-		var signalState = this.peerConnection.signalingState;
-		if (this._send_channel !== null && this._send_channel.readyState === "open") {
-			this._send_channel.close();
+	close() {
+		this._disposed = true;
+		clearTimeout(this._resetTimer);
+		this._resetTimer = null;
+		this.signaling.disconnect();
+		for (const stream of [this._micStream, this._webcamStream]) {
+			for (const track of stream?.getTracks() || []) track.stop();
 		}
-		if (this.peerConnection !== null) this.peerConnection.close();
-		if (signalState !== "stable") {
-			setTimeout(() => {
-					this.connect();
+		this._micStream = null;
+		this._webcamStream = null;
+		this._closePeer();
+	}
+
+	_closePeer() {
+		if (this._send_channel) {
+			this._send_channel.onopen = null;
+			this._send_channel.onclose = null;
+			this._send_channel.onerror = null;
+			this._send_channel.onmessage = null;
+			this._send_channel.close();
+			this._send_channel = null;
+		}
+		if (this.peerConnection) {
+			this.peerConnection.ontrack = null;
+			this.peerConnection.onicecandidate = null;
+			this.peerConnection.ondatachannel = null;
+			this.peerConnection.onconnectionstatechange = null;
+			this.peerConnection.close();
+			this.peerConnection = null;
+		}
+	}
+
+	reset() {
+		if (this._disposed) return;
+		// _closePeer() ends both receiver tracks and the engine paints the
+		// element black within a frame, so the picture is copied out first. The
+		// media is left alone: this element is the one the new peer connection
+		// attaches to, and its first painted frame drops the copy again.
+		freezeVideoFrame(this.element, { stopMedia: false });
+		this.cursor_cache = new Map();
+		clearTimeout(this._resetTimer);
+		const signalState = this.peerConnection?.signalingState;
+		this.signaling.disconnect();
+		this._closePeer();
+		if (signalState && signalState !== "stable") {
+			this._resetTimer = setTimeout(() => {
+				this._resetTimer = null;
+				this.connect();
 			}, 3000);
 		} else {
 			this.connect();

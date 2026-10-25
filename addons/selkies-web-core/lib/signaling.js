@@ -1,4 +1,4 @@
-/* This Source Code Form is subject to the terms of the Mozilla Public
+/*! This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
@@ -39,6 +39,8 @@
  * the browser re-runs HTTP authentication.
  * @module
  */
+
+import { sessionPeerId } from './util.js';
 
 /**
  * Connection to the signaling server, delivering SDP and ICE to callbacks.
@@ -98,6 +100,14 @@ export class WebRTCSignaling {
 
         /** Called with whether the app should reconnect. @type {?function(boolean): void} */
         this.ondisconnect = null;
+        this.onserverdisconnect = null;
+        /**
+         * The container ended this peer itself (close code 4003: ICE consent
+         * expired, a failed transport). Without a handler the close is taken
+         * like any other and the app rebuilds the peer at once.
+         * @type {?function(): void}
+         */
+        this.onpeerclosed = null;
 
         /** `'disconnected'`, `'connecting'` or `'connected'`. @type {string} */
         this.state = 'disconnected';
@@ -146,6 +156,14 @@ export class WebRTCSignaling {
 
         /** @type {?function(string): void} */
         this.onshowalert = null;
+        /**
+         * Another connection took this display's controller role or this
+         * client slot (server close code 4001). Separate from `onshowalert`:
+         * this is a normal multi-tab outcome, not a fault, and the page turns
+         * it into a "take control" prompt instead of an alert box.
+         * @type {?function(string): void}
+         */
+        this.onsuperseded = null;
     }
 
     /** Forwards a status message to `onstatus`. */
@@ -190,6 +208,11 @@ export class WebRTCSignaling {
     _onServerOpen() {
         this.state = 'connected';
         const meta = {
+            // Session hook (lib/util.js): the same id the websocket sink client
+            // sends, so a container serving both outputs hands the consumer
+            // entry over on a socket to WebRTC upgrade instead of superseding
+            // it. Older servers ignore the extra key.
+            'session_peer_id': sessionPeerId(),
             'client_type': this.client_type,
             'client_slot': this.client_slot,
             'client_strict_viewer': this.client_strict_viewer,
@@ -257,7 +280,7 @@ export class WebRTCSignaling {
             return;
         }
 
-        if (event.data.startsWith("SESSION_OK")) { 
+        if (event.data.startsWith("SESSION_OK")) {
             this._setStatus("Session established with server.");
             this.server_peer_id = event.data.split(" ")[1];
             return;
@@ -301,9 +324,10 @@ export class WebRTCSignaling {
      * say) schedules the retry itself, since the paired `error` event is not
      * guaranteed to observe `readyState` CLOSED. Afterwards the close code
      * decides: 4000 shows the server's reason; 4001 means another live
-     * connection superseded this session, and auto-reconnecting would make
-     * the two pages evict each other forever, so it stays down and tells the
-     * user; a clean close that `disconnect` requested reports
+     * connection superseded this session (`onsuperseded`), and auto-reconnecting
+     * would make the two pages evict each other forever, so it stays down and
+     * the page offers to take control back; 4003 means the container ended the
+     * peer (`onpeerclosed`); a clean close that `disconnect` requested reports
      * `ondisconnect(false)`; any other server-initiated close reports
      * `ondisconnect(true)` so the app recovers like the WebSocket transport
      * (reconnect, and repeated failures reload for re-authentication).
@@ -320,12 +344,23 @@ export class WebRTCSignaling {
         const intentional = this._intentional_close;
         this._intentional_close = false;
         if (this.ondisconnect !== null) {
-            if (event.code === 4000) {
+            if (event.code === 4000 && event.reason === "Server disconnected, closing connection.") {
+                if (this.onserverdisconnect !== null) this.onserverdisconnect();
+                else this.ondisconnect(true);
+            } else if (event.code === 4000) {
                 if (this.onshowalert !== null) this.onshowalert(event.reason);
             } else if (event.code === 4001) {
-                if (this.onshowalert !== null) {
+                // The signaling server allows one controller per display and one
+                // client per slot, newest wins; this connection is the loser.
+                // Never an alert: it is what a second tab of the same session
+                // does, and reconnecting would make the two evict each other.
+                if (this.onsuperseded !== null) {
+                    this.onsuperseded(event.reason || 'superseded');
+                } else if (this.onshowalert !== null) {
                     this.onshowalert(event.reason || 'Session superseded by a new connection. Reload to take over.');
                 }
+            } else if (event.code === 4003 && this.onpeerclosed !== null) {
+                this.onpeerclosed();
             } else if ((event.code === 1000 || event.code === 1001) && intentional) {
                 this.ondisconnect(false);
             } else {
@@ -343,18 +378,36 @@ export class WebRTCSignaling {
         this.state = 'connecting';
         this._setStatus("Connecting to server.");
 
-        this._ws_conn = new WebSocket(this._server);
-
-        this._ws_conn.addEventListener('open', this._onServerOpen.bind(this));
-        this._ws_conn.addEventListener('error', this._onServerError.bind(this));
-        this._ws_conn.addEventListener('message', this._onServerMessage.bind(this));
-        this._ws_conn.addEventListener('close', this._onServerClose.bind(this));
+        this.disconnect();
+        this._intentional_close = false;
+        this.state = 'connecting';
+        const socket = new WebSocket(this._server);
+        this._ws_conn = socket;
+        this._socketHandlers = Object.entries({
+            open: this._onServerOpen,
+            error: this._onServerError,
+            message: this._onServerMessage,
+            close: this._onServerClose,
+        }).map(([type, handler]) => {
+            const listener = event => {
+                if (this._ws_conn === socket && !this._intentional_close) handler.call(this, event);
+            };
+            socket.addEventListener(type, listener);
+            return [type, listener];
+        });
     }
 
-    /** Closes the socket; the close is reported as `ondisconnect(false)`, not as a drop. */
+    /** Removes pending reconnects before closing an intentionally retired socket. */
     disconnect() {
         this._intentional_close = true;
-        this._ws_conn.close();
+        if (this._retry_timer !== null) clearTimeout(this._retry_timer);
+        this._retry_timer = null;
+        const socket = this._ws_conn;
+        this._ws_conn = null;
+        for (const [type, listener] of this._socketHandlers || []) socket?.removeEventListener(type, listener);
+        this._socketHandlers = [];
+        if (socket && socket.readyState < 2) socket.close();
+        this.state = 'disconnected';
     }
 
     /**

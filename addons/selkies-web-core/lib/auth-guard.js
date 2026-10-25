@@ -1,4 +1,4 @@
-/*
+/*!
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0 (the "License"); you may not use this file except in
  * compliance with the License. A copy of the License is at
@@ -29,6 +29,7 @@
  * through `location.reload()`.
  * @module
  */
+import { sessionStore } from './web-storage.js';
 
 let installed = false;
 
@@ -38,7 +39,7 @@ let installed = false;
  * The server's token verdicts (secure mode: a route wanting a session or
  * master token) name the Bearer scheme in `WWW-Authenticate`; a reload would
  * re-present the very same token, so those are left to the caller (the
- * file-upload error, the mode-switch master-token prompt).
+ * mode-switch master-token prompt).
  */
 export function installAuthGuard() {
     if (installed || typeof window === 'undefined') return;
@@ -49,9 +50,9 @@ export function installAuthGuard() {
     const MAX_CHAIN = 2;
     const readStamp = () => {
         try {
-            const s = JSON.parse(sessionStorage.getItem(STAMP_KEY) || 'null');
+            const s = JSON.parse(sessionStore.getItem(STAMP_KEY) || 'null');
             if (s) return s;
-        } catch (_) { /* storage blocked */ }
+        } catch (_) { /* not a stamp */ }
         try {
             const h = window.history.state;
             if (h && typeof h === 'object' && h[STAMP_KEY]) return h[STAMP_KEY];
@@ -59,12 +60,7 @@ export function installAuthGuard() {
         return null;
     };
     const writeStamp = (stamp) => {
-        let stored = false;
-        try {
-            sessionStorage.setItem(STAMP_KEY, JSON.stringify(stamp));
-            stored = true;
-        } catch (_) { /* storage blocked */ }
-        if (stored) return;
+        if (sessionStore.setItem(STAMP_KEY, JSON.stringify(stamp))) return;
         try {
             const h = window.history.state;
             if (h == null || (typeof h === 'object' && !Array.isArray(h))) {
