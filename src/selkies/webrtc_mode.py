@@ -199,6 +199,8 @@ class WebRTCService(BaseStreamingService):
         _wm_swap: Swaps heavy DEs, which tile poorly across the per-display
             regions, for a minimal Openbox once a secondary joins.
         _primary_stop_grace_task: The pending deferred primary-capture stop.
+        _stream_controllers: The congestion loop's StreamController per
+            display pipeline, dropped with the display's last consumer.
         _mic_control: Sound-server control connection for the shared
             SelkiesVirtualMic, provisioned once on the first mic packet (the
             data plane is per-peer pcmflux playback into the input sink).
@@ -253,6 +255,7 @@ class WebRTCService(BaseStreamingService):
         self._wm_swap = MultiMonitorWindowManager()
         self.RECONNECT_GRACE_S = 3.0
         self._primary_stop_grace_task: Optional[asyncio.Task] = None
+        self._stream_controllers: Dict[MediaPipelinePixel, Any] = {}
 
         self._mic_control: Optional[AudioControl] = None
         self._mic_module_index: Optional[int] = None
@@ -1206,9 +1209,16 @@ class WebRTCService(BaseStreamingService):
         reconnect grace (a controller tab reload reconnects within a second or
         two and reuses the warm capture, and viewers/display2 keep streaming
         throughout - websockets _teardown_if_unclaimed parity); a secondary is
-        fully unregistered and the desktop re-laid-out at once."""
+        fully unregistered and the desktop re-laid-out at once. The RTC side
+        calls this when its last peer leaves, so the primary forgets its
+        adaptation only while no sink client consumes it either: with the
+        capture stopping after the grace, or at once when it already stopped
+        (every consumer was paused). A consumer back within the grace (a
+        reload, a signaling drop) keeps the stream as it was."""
         if display_id == "primary":
             self._schedule_primary_stop_grace()
+            if self._primary_stop_grace_task is None and not self._primary_display_has_consumer():
+                await self._reset_stream_adaptation(display_id)
             return
         async with self._display_lock:
             pipeline = self.display_pipelines.pop(display_id, None)
@@ -1219,6 +1229,27 @@ class WebRTCService(BaseStreamingService):
             if pipeline is not None:
                 await pipeline.stop_media_pipeline()
         await self.reconfigure_displays()
+
+    async def _reset_stream_adaptation(self, display_id: str) -> None:
+        """Return a display without consumers to the encoder state a new
+        pipeline starts in: a fresh congestion controller, no pixel cap, the
+        startup bitrate and the display's frame rate (bitrate first, so the
+        frame-rate reopen keys at the new rate). What the loop learned
+        describes the departed consumers' links, and the next consumer's
+        link is unknown: carried over, a ramped rate overran a slower link
+        before its first feedback and a backed-off one recovered at the
+        congested pace. A warm capture keeps running for a reconnect."""
+        pipeline = self.display_pipelines.get(display_id)
+        if pipeline is None:
+            return
+        self._stream_controllers.pop(pipeline, None)
+        getattr(self, "_stream_pixel_caps", {}).pop(display_id, None)
+        if not self.args.congestion_control or pipeline.rc_mode != RateControlMode.CBR:
+            return
+        from .stream_control import CONFIG
+        ceiling = int(self._display_setting(display_id, "video_bitrate"))
+        await pipeline.set_video_bitrate(min(ceiling, int(CONFIG["startup_kbps"])))
+        await pipeline.set_framerate(int(self._display_setting(display_id, "framerate")))
 
     def _cancel_primary_stop_grace(self) -> None:
         """Drop a pending deferred primary-capture stop: a consumer reclaimed
@@ -1254,6 +1285,7 @@ class WebRTCService(BaseStreamingService):
             if self.media_pipeline is not None:
                 logger.info("Primary unclaimed after the grace; stopping its capture.")
                 await self.media_pipeline.stop_media_pipeline()
+            await self._reset_stream_adaptation("primary")
 
         self._primary_stop_grace_task = asyncio.create_task(_stop_after_grace())
 
@@ -2603,7 +2635,7 @@ class WebRTCService(BaseStreamingService):
         pacer_on = bool(settings.webrtc_pacer[0])
         logger.info(f"WebRTC pacer setting: {'ON' if pacer_on else 'OFF'}.")
         from .stream_control import CONFIG, StreamController
-        controllers = {}
+        controllers = self._stream_controllers
         while True:
             await asyncio.sleep(1.0)
             lo_kbps, hi_kbps = settings.video_bitrate
@@ -2643,7 +2675,8 @@ class WebRTCService(BaseStreamingService):
                 self.ws_sink.merge_congestion(per_display)
             if self.metrics is not None:
                 self.metrics.set_bridge_drops(rtc_app.bridge_drops())
-            controllers = {p: c for p, c in controllers.items() if p in self.display_pipelines.values()}
+            for retired in [p for p in controllers if p not in self.display_pipelines.values()]:
+                del controllers[retired]
             active_displays = {"primary", *self.display_clients, *self.display_pipelines}
             for name in ("_stream_requested_dims", "_stream_pixel_caps"):
                 values = getattr(self, name, None)
