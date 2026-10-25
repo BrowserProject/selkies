@@ -58,7 +58,8 @@ CLASS_VIDEO = 2
 _QUEUED_CLASSES = (CLASS_DC, CLASS_VIDEO)
 
 # Pace above the encoder target when the link allows.
-PACE_FACTOR = 2.5
+# Reserve wire headroom without sending multi-frame bursts at four times the link budget.
+PACE_FACTOR = 1.5
 # Wire share reserved for bypass classes (audio + RTCP + DC) when braking
 # from an estimate.
 BYPASS_RESERVE_BPS = 500_000
@@ -68,7 +69,8 @@ OVERFLOW_RECOVERY_PER_S = 0.25
 # Brake depth floor (x encoder target): chained overflow brakes must never
 # crater the stream into a starvation valley that +25%/s takes seconds to
 # climb out of.
-AIMD_FLOOR_FACTOR = 0.35
+# Above 1.0: pacing below the encoder injection rate makes every following overflow self-inflicted.
+AIMD_FLOOR_FACTOR = 1.25
 # Burst credit window: how much wire time the bucket may hoard. Wider windows
 # let video bursts land in front of audio.
 DEBT_WINDOW_S = 0.005
@@ -323,7 +325,9 @@ class RtpPacer:
 
     def _video_cap_bytes(self) -> int:
         base = int(self._pace_bps / 8.0 * CAP_MIN_MS / 1000)
-        return max(base, self._idr_floor_bytes)
+        from ..stream_control import CONFIG
+        burst = int(self._encoder_bps / 8 * CONFIG["vbv_seconds"] * AIMD_FLOOR_FACTOR)
+        return max(base, burst, self._idr_floor_bytes)
 
     # ----------------------------------------------------------------- inputs
     def note_keyframe(self, total_payload_bytes: int, natural: bool = True) -> None:
